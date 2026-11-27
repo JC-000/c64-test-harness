@@ -27,6 +27,9 @@ Pre-flight, before any lock, client, upload or JTAG pin is driven. An image is o
 Everything else is refused: update images of either product, .cfw files, garbage. So is any file that holds an
 updater prompt string or the SILENT marker (ultimate64_firmware_flash.PROMPT_STRINGS / SILENT_MARKER), whatever
 its shape: an updater that is started writes flash. The image's family must equal the device's.
+What this refuses is update images as they are built: by structure, and by the updater's strings. It cannot tell
+what an application does: a hand-made RAM-run wrapper around an updater that carries none of those strings would
+pass.
 
 The image must also BE the build the caller names. Both formats carry the application's System Info line,
 "Git hash:   <hash>" (system_info.cc: "Git hash:   " APP_VERSION_HASH "\\n"), where the hash is the build's
@@ -51,8 +54,14 @@ A same-hash RAM-run cannot be proven started (#570), so ram_run refuses it; vola
 that already reports the baseline hash therefore loads nothing and says so (loaded False, restart_proof "none"):
 that the running image IS the baseline file is then not proven, only that the hashes agree.
 
-No JTAG operation is given less than MIN_JTAG_TIMEOUT_S: ``jtag_timeout`` below that is refused. The cold esp-jtag
-load is never interrupted by this code at all; the value is the budget handed to the U64 JTAG reload.
+``jtag_timeout`` below MIN_JTAG_TIMEOUT_S is refused. It is the budget handed to the U64 JTAG reload and applies
+to nothing else: it does not reach jtag_load.py. This file puts no deadline around the cold esp-jtag load, but
+jtag_load.py runs it with the kit's link timeout of 10 s per adapter transaction, and after a link error once the
+FPGA is programmed it retries the whole load once and then leaves the box dark. So "no timeout under 300 s around a
+JTAG operation" holds for the deadlines this file sets, not for that per-transaction one.
+
+On the RAM-run path the staged file is uploaded without overwriting: a file already on the volume under the staging
+name stops the load, and is neither replaced nor deleted.
 
 Baseline, in the device's table of the local bench.toml (never in a tracked file, never in devices.toml):
 
@@ -364,11 +373,35 @@ def _backend_for(family: str, dark: bool, prep: _Prepared, o: _Opts) -> str:
     return BACKEND_U64_JTAG
 
 
+class _StageOnly:
+    """The storage ram_run is given: its two calls, with the upload never overwriting. ram_run stages with
+    overwrite=True and deletes the staged name afterwards, so a file that was already there under that name would
+    be replaced and then removed. Here the upload refuses an existing file before anything is written, and ram_run
+    (which uploads before its try/finally) then deletes nothing."""
+
+    def __init__(self, storage):
+        self._storage = storage
+
+    def storage_put_file(self, host, path, data, overwrite=False):
+        try:
+            return self._storage.storage_put_file(host, path, data, overwrite=False)
+        except FileExistsError:
+            raise jl.JtagLoadError("storage", f"{path} already exists on the device: it is not this run's staged "
+                                   "image, so it is neither overwritten nor deleted; remove or rename it") from None
+
+    def storage_delete_file(self, host, path, missing_ok=False):
+        return self._storage.storage_delete_file(host, path, missing_ok=missing_ok)
+
+
 def _run_backend(backend: str, host: str, prep: _Prepared, o: _Opts, dry_run: bool = False) -> dict:
     if backend == BACKEND_RAM_RUN:
+        storage = o.storage
+        if storage is None:
+            from c64_test_harness.backends import ultimate64_storage as storage
         kw = dict(sha256=prep.image.sha256, expect_git_hash=prep.embedded, volume=o.volume,
                   lock_timeout=o.lock_timeout, dry_run=dry_run, lock_factory=o.lock_factory,
-                  client_factory=o.client_factory, storage=o.storage, sleep=o.sleep, clock=o.clock, log=o.log)
+                  client_factory=o.client_factory, storage=_StageOnly(storage), sleep=o.sleep, clock=o.clock,
+                  log=o.log)
         if o.menu_factory is not None:
             kw["menu_factory"] = o.menu_factory
         return o.ram_run(host, prep.copy, **kw)
@@ -390,6 +423,17 @@ def _reports(info: dict | None, embedded: str) -> bool:
     return info is not None and str(info.get("git_commit_hash") or "").strip().lower() == embedded
 
 
+def _hash_known(info: dict | None) -> bool:
+    """Whether /v1/info reported a hash at all (7+ hex digits). Firmware that does not report the key gives none."""
+    return info is not None and re.fullmatch(r"[0-9a-fA-F]{7,40}", str(info.get("git_commit_hash") or "").strip()) \
+        is not None
+
+
+def _hash_changed(pre: dict | None, embedded: str):
+    """True/False when the device reported a hash before the load; None when what ran before is unknown."""
+    return (not _reports(pre, embedded)) if _hash_known(pre) else None
+
+
 def _verify(res: VolatileResult, rec: dict, uid: str, family: str, expect: str, pre: dict | None) -> None:
     """The running firmware must be the bound device, of the image's family, reporting the image's own hash
     (*expect*); then say what is proven about the restart."""
@@ -401,7 +445,7 @@ def _verify(res: VolatileResult, rec: dict, uid: str, family: str, expect: str, 
     if not _reports(info, expect):
         raise jl.JtagLoadError("verify", f"the running firmware reports git hash {res.git_hash!r}, the image's is "
                                f"{expect}")
-    res.hash_changed = None if pre is None else not _reports(pre, expect)
+    res.hash_changed = _hash_changed(pre, expect)
     if res.backend == BACKEND_JTAG_COLD:
         if rec.get("cold") is not True or rec.get("user_id") != f"{jl.EXPECT_USERID:08x}":
             raise jl.JtagLoadError("verify", f"the JTAG load does not record a cold load with the user ID read back "
@@ -412,8 +456,9 @@ def _verify(res: VolatileResult, rec: dict, uid: str, family: str, expect: str, 
     elif pre is None:
         res.restart_proof = "dark-then-answering"
     else:
-        raise jl.JtagLoadError("verify", f"the device reported {expect} before the load as well, and this backend "
-                               "gives no other evidence of a restart (#570)")
+        raise jl.JtagLoadError("verify", f"the device did not report another hash than {expect} before the load "
+                               f"(it reported {pre.get('git_commit_hash')!r}), and this backend gives no other "
+                               "evidence of a restart (#570)")
 
 
 def _load(host: str, image: VolatileImage, action: str, o: _Opts, *, skip_if_running: bool = False,
@@ -460,6 +505,11 @@ def _load(host: str, image: VolatileImage, action: str, o: _Opts, *, skip_if_run
                                      "be proven started (#570), so that the running image is this file is not proven")
                     res.timings["total_s"] = round(o.clock() - t0, 3)
                     return res
+                if res.backend == BACKEND_RAM_RUN and not _hash_known(pre):
+                    raise jl.JtagLoadError("run", f"the device reports no git hash before the load "
+                                           f"({pre.get('git_commit_hash')!r}), so a change to {prep.embedded} could "
+                                           "not be shown and a RAM-run has no other evidence of a restart (#570); "
+                                           "nothing was staged")
                 res.record = _run_backend(res.backend, host, prep, o)
                 step("load")
                 _verify(res, res.record, uid, prep.family, prep.embedded, pre)
@@ -502,12 +552,13 @@ def volatile_restore(host: str, *, force: bool = False, dry_run: bool = False, *
 
 class VolatileSession:
     """What volatile_session yields. ``load``: the result of the image's load. ``baseline_first`` / ``restore``:
-    those results, when they ran. ``restore_error``: why the restore failed. ``lock_in_process``: False when a
+    those results, when they ran. ``restore_error``: why the restore failed. ``restore_skipped``: why none was
+    started (an interrupt). ``lock_in_process``: False when a
     lock shell holds the DeviceLock, in which case harness helpers that check for an in-process hold refuse."""
 
     def __init__(self, host: str, options: dict):
         self.host, self._options = host, options
-        self.baseline_first = self.load = self.restore = self.restore_error = None
+        self.baseline_first = self.load = self.restore = self.restore_error = self.restore_skipped = None
         self.lock_in_process = False
         self.loads: list[VolatileResult] = []
 
@@ -528,7 +579,9 @@ def volatile_session(host: str, image: VolatileImage, *, baseline_first: bool = 
     the recovery path while the device still runs something known; if that fails, *image* is never loaded. With
     restore=True (default) the baseline is restored on the way out, also when the load or the body raised: the
     body's exception then propagates and a restore failure is kept in ``restore_error`` (and logged), never raised
-    over it. A restore failure after a clean body is raised.
+    over it. A restore failure after a clean body is raised. A KeyboardInterrupt or SystemExit starts no restore
+    (``restore_skipped`` says so): a load of minutes behind a Ctrl-C would invite the second Ctrl-C that cuts a JTAG
+    load half-way.
 
     Both images and the binding are checked before the lock is taken."""
     o = _opts(dict(options))
@@ -551,8 +604,15 @@ def volatile_session(host: str, image: VolatileImage, *, baseline_first: bool = 
             s.load = volatile_load(host, image, **options)
             s.loads.append(s.load)
             yield s
-        except BaseException as e:
+        except Exception as e:
             body_exc = e
+            raise
+        except BaseException as e:      # KeyboardInterrupt, SystemExit: the operator said stop
+            if restore:
+                s.restore_skipped = (f"{type(e).__name__}: no restore was started; the device runs what was loaded "
+                                     "last, or nothing. Run volatile_restore when ready")
+                o.log(f"volatile_session: {s.restore_skipped}")
+            restore = False
             raise
         finally:
             if restore:
@@ -589,7 +649,8 @@ def main(argv=None) -> int:
         p.add_argument("--lock-timeout", type=float, default=600)
         p.add_argument("--net-timeout", type=float, default=180)
         p.add_argument("--jtag-timeout", type=float, default=600,
-                       help=f"budget of a JTAG operation; under {MIN_JTAG_TIMEOUT_S:.0f} s is refused")
+                       help=f"budget of the U64 JTAG reload only (a C64 Ultimate load takes none); under "
+                            f"{MIN_JTAG_TIMEOUT_S:.0f} s is refused")
         p.add_argument("--dry-run", action="store_true", help="print the plan; nothing is locked or touched")
         p.add_argument("--record", default=None, help="append a JSON line per action here")
     a = ap.parse_args(argv)

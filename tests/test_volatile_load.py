@@ -75,6 +75,7 @@ class FakeU64:
     def __init__(self, ev, known, running="f1a54ed00", uid="ABC123", product="Ultimate 64 Elite"):
         self.ev, self.known, self.running, self.uid, self.product = ev, known, running, uid, product
         self.files, self.flashed, self.dark, self.dies_on_run, self.boots_as = {}, False, False, False, None
+        self.misses = 0                 # /v1/info reads that go unanswered before it answers again
 
     # REST
     def client(self, host, timeout=5.0):
@@ -82,9 +83,15 @@ class FakeU64:
 
     def get_info(self):
         self.ev.append(("get_info",))
+        if self.misses:
+            self.misses -= 1
+            raise ConnectionError("busy")
         if self.dark:
             raise ConnectionError("down")
-        return {"unique_id": self.uid, "product": self.product, "git_commit_hash": self.running}
+        out = {"unique_id": self.uid, "product": self.product, "git_commit_hash": self.running}
+        if self.running is None:        # a firmware that does not report the key
+            del out["git_commit_hash"]
+        return out
 
     # telnet menu: the private driver steps ram_run_u64.run_update_ramrun takes
     def menu(self, host):
@@ -135,6 +142,8 @@ class Storage:
         self.dev = dev
 
     def storage_put_file(self, host, path, data, overwrite=False):
+        if path in self.dev.files and not overwrite:        # as the harness helper: refused before any write
+            raise FileExistsError(path)
         self.dev.ev.append(("put", path))
         self.dev.files[path] = bytes(data)
 
@@ -494,6 +503,42 @@ def test_a_c64u_that_reports_another_hash_after_the_load_fails(bench):
     assert e.value.stage == "network" and e.value.result.loaded is False
 
 
+@pytest.mark.parametrize("before", [None, "", "unknown"], ids=["no-key", "empty", "not-hex"])
+def test_a_u64_that_reports_no_hash_before_the_load_is_refused_unstaged(bench, before):
+    """Without a hash before the load, the hash afterwards shows no change, and a RAM-run has no other evidence of a
+    restart (#570): as for a same-hash load, nothing is staged."""
+    bench.u64.running = before
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64))
+    r = e.value.result
+    assert e.value.stage == "run" and (r.loaded, r.restart_proof, r.hash_changed) == (False, "none", None)
+    assert not bench.names("put", "run")
+
+
+def test_no_hash_change_is_claimed_when_the_hash_before_is_unknown(bench):
+    """A backend that loads anyway: the hash before was not reported, so "hash-change" is not what proves it."""
+    bench.u64.running = None
+
+    def runner(host, image, **kw):
+        return {"result": "ok", "info": {"unique_id": "ABC123", "product": "Ultimate 64 Elite",
+                                         "git_commit_hash": HASH_A}}
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64, ram_run=runner))
+    assert (e.value.result.restart_proof, e.value.result.hash_changed) == ("none", None)
+    bench.c64u.running = None           # the cold JTAG load proves itself; the hash change stays unknown
+    r = vl.volatile_load("c64u", bench.c_a, **bench.opts(bench.c64u))
+    assert (r.ok, r.restart_proof, r.hash_changed) == (True, "jtag-reconfigured", None)
+
+
+def test_a_jtag_record_without_the_user_id_read_back_is_not_a_proven_reload(bench):
+    def runner(host, bit, app, **kw):
+        return {"cold": True, "user_id": None, "info": {"unique_id": "DEF456", "product": "C64 Ultimate",
+                                                        "git_commit_hash": HASH_A}}
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_load("c64u", bench.c_a, **bench.opts(bench.c64u, jtag_load=runner))
+    assert e.value.stage == "verify" and e.value.result.loaded is False
+
+
 # ---- 4. restore, the session, baseline first ----------------------------------------------------------------------
 
 def test_restore_loads_the_configured_baseline(bench):
@@ -510,6 +555,32 @@ def test_restore_on_a_u64_already_at_the_baseline_loads_nothing_and_says_so(benc
     r = vl.volatile_restore("u64e", **bench.opts(bench.u64))
     assert (r.ok, r.loaded, r.restart_proof, r.hash_changed) == (True, False, "none", False)
     assert r.notes and not bench.names("put", "run")
+
+
+def test_restore_loads_when_the_running_hash_only_shares_leading_digits_with_the_baseline(bench):
+    bench.u64.running = HASH_BASE[:7] + "ff"
+    r = vl.volatile_restore("u64e", **bench.opts(bench.u64))
+    assert (r.ok, r.loaded, r.git_hash, r.restart_proof) == (True, True, HASH_BASE, "hash-change")
+
+
+def test_a_baseline_of_the_other_family_is_refused_before_the_lock(bench):
+    bench.toml.write_text(bench.toml.read_text().replace(
+        "[devices.0a0b0c]\nram_run = true\n", "[devices.0a0b0c]\nram_run = true\n" + bench.baseline(bench.c_base)))
+    dev = FakeU64(bench.ev, bench.known, uid="0A0B0C")
+    with pytest.raises(jl.JtagLoadError) as e:
+        with vl.volatile_session("both", bench.u_a, **bench.opts(dev)):
+            pytest.fail("the body ran")
+    assert e.value.stage == "baseline" and bench.ev == []
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_an_interrupt_in_the_body_starts_no_restore(bench, interrupt):
+    """Ctrl-C means stop: a minutes-long load is not started behind it (a second Ctrl-C would cut that load)."""
+    with pytest.raises(interrupt):
+        with vl.volatile_session("c64u", bench.c_a, **bench.opts(bench.c64u)) as s:
+            raise interrupt()
+    assert s.restore is None and s.restore_skipped and len(bench.names("load_fpga_and_upload")) == 1
+    assert bench.c64u.get_info()["git_commit_hash"] == HASH_A          # the image is still what runs
 
 
 def test_restore_without_a_configured_baseline_is_refused(bench):
@@ -617,6 +688,23 @@ def test_a_jtag_timeout_under_300_s_is_refused(bench, value):
             call()
         assert e.value.stage == "timeout"
     assert bench.ev == []
+
+
+@pytest.mark.parametrize("value", [300, 300.0, "300", 3600])
+def test_a_jtag_timeout_of_300_s_or_more_is_accepted(bench, value):
+    assert vl.volatile_load("c64u", bench.c_a, **bench.opts(bench.c64u, jtag_timeout=value)).ok
+
+
+@pytest.mark.parametrize("misses", [1, 2])
+def test_a_box_that_misses_fewer_than_three_polls_is_not_dark(bench, misses):
+    """Dark means three unanswered reads in a row. One or two misses of a busy box choose nothing: the product is
+    read, the RAM-run is taken, and no "dark-then-answering" proof is on offer."""
+    bench.u64.misses = misses
+    reloads = []
+    r = vl.volatile_load("u64e", bench.u_a, **bench.opts(
+        bench.u64, u64_jtag_reload=lambda *a, **k: reloads.append(a)))
+    assert (r.ok, r.dark_before, r.backend, r.restart_proof) == (True, False, "ram_run", "hash-change")
+    assert reloads == []
 
 
 def test_a_dark_u64_without_a_jtag_reload_is_refused_and_nothing_is_staged(bench):
@@ -743,6 +831,14 @@ def test_a_whole_u64_session_writes_only_the_staged_files_and_leaves_none(bench)
     staged = ["/USB1/rraaaaaa.u64", "/USB1/rrbbbbbb.u64", "/USB1/rrba5e11.u64"]
     assert bench.names("put", "delete", "storage-other") == [x for p in staged for x in (("put", p), ("delete", p))]
     assert bench.u64.files == {} and not bench.u64.flashed
+
+
+def test_a_file_already_at_the_staging_name_is_neither_overwritten_nor_deleted(bench):
+    bench.u64.files["/USB1/rraaaaaa.u64"] = b"SOMEONE ELSE'S FILE"
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64))
+    assert e.value.stage == "storage" and bench.u64.files == {"/USB1/rraaaaaa.u64": b"SOMEONE ELSE'S FILE"}
+    assert not bench.names("put", "delete", "run")
 
 
 # ---- 8. no warm load on the C64 Ultimate --------------------------------------------------------------------------

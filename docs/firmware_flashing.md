@@ -617,7 +617,10 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   `ultimate.bin` carries nothing to check and is not accepted). Update
   images, `.cfw` files and garbage are refused, and so is any file holding
   an updater prompt string or the SILENT marker, whatever its shape. The
-  image's family must be the device's.
+  image's family must be the device's. What this refuses is update images
+  as they are built, by structure and by the updater's strings. It cannot
+  tell what an application does: a hand-made RAM-run wrapper around an
+  updater that carries none of those strings would pass.
 - **The image must be the build the caller names.** Both formats carry
   the application's System Info line, `Git hash:   <hash>`
   (`system_info.cc`), where the hash is the build's
@@ -647,7 +650,11 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   started: `hash-change`; `jtag-reconfigured` (the FPGA was reloaded cold
   and the user ID read back, which also covers a same-hash load);
   `dark-then-answering`; or `none`. A same-hash RAM-run cannot be proven
-  (#570) and `ram_run` refuses it. So `volatile_restore` on a U64-line
+  (#570) and `ram_run` refuses it. A U64-line device that reports no hash
+  before the load (no `git_commit_hash`, or one that is not 7 or more hex
+  digits) is refused the same way, before anything is staged: a change
+  could not be shown, and `hash_changed` is `None` whenever the hash
+  before is unknown. So `volatile_restore` on a U64-line
   device that already reports the baseline hash loads nothing and returns
   `loaded` False with `restart_proof` `none`: the hashes agree, and that
   the running image is the baseline file is not proven. For the same
@@ -662,7 +669,11 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   box). The session restores on the way out, also when the load or the
   body raised. The body's exception propagates; a restore failure is then
   kept in `session.restore_error` and logged, and is raised only after a
-  clean body.
+  clean body. A `KeyboardInterrupt` or `SystemExit` starts no restore
+  (`session.restore_skipped` says so): the device keeps running what was
+  loaded last, and `volatile_restore` is the operator's next step. A
+  restore of minutes behind a Ctrl-C would invite the second Ctrl-C that
+  cuts a JTAG load half-way.
 - **Lock.** The session takes the `DeviceLock` in this process
   (`allow_nested`), so the backends and the harness helpers called in the
   body join it. Under a verified lock shell it takes none
@@ -676,11 +687,21 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   `jtag_load.py`'s live IDCODE gate still runs before the FPGA is touched.
 - **Cold only.** The C64 Ultimate load is always cold. There is no option
   for a warm load, and `JTAG_LOAD_WARM` is not honoured here.
-- **JTAG timeout.** `jtag_timeout` under 300 s is refused. The cold
-  esp-jtag load is never interrupted by this code; the value is the budget
-  handed to the U64 JTAG reload.
-- **Storage.** On the RAM-run path the only storage writes are
-  `ram_run_u64.py`'s: one staged file, deleted again.
+- **JTAG timeout.** `jtag_timeout` under 300 s is refused (300 passes).
+  It is the budget handed to the U64 JTAG reload and applies to nothing
+  else: it does not reach `jtag_load.py`, so it changes nothing for a C64
+  Ultimate. `volatile_load.py` puts no deadline around the cold esp-jtag
+  load, but `jtag_load.py` runs it with the kit's link timeout of 10 s per
+  adapter transaction, and after a link error once the FPGA is programmed
+  it retries the whole load once and then leaves the box dark. Whether a
+  single transaction can need more than 10 s is not known here.
+- **Storage.** On the RAM-run path the only storage calls are
+  `ram_run_u64.py`'s: one staged file, deleted again. The upload never
+  overwrites: a file already on the volume under the staging name
+  (`rr` plus six hash digits, `.u64`) stops the load and is neither
+  replaced nor deleted.
+- **Dark.** A box is dark only after three unanswered `/v1/info` reads in
+  a row; one or two misses choose nothing.
 
 ```
 volatile_load.py load    HOST IMAGE --sha256 H --expect-hash G [--bit F --bit-sha256 H]
