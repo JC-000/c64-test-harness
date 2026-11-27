@@ -17,11 +17,11 @@ product lists. All of them mean the cartridge in a real C64.
 | Ultimate-II+, II+L | yes | yes | `u2p_riscv_lattice.vhd`, `u2p_riscv.vhd`, `u2p_nios2_solo.vhd` set both |
 | 1541 Ultimate-II, dual-drive image | yes | yes | `ultimate_mb_700a.vhd`, `ultimate_riscv_700a.vhd`: `g_c2n_recorder => g_dual_drive`; built with `g_dual_drive=true` (`target/fpga/mb700dd`, `mb700gm`, `rv700dd`) |
 | 1541 Ultimate-II, single-drive image | yes | **no** | same files; built with `g_dual_drive=false` (`target/fpga/mb700`, `rv700au`) |
+| Ultimate 64, Ultimate 64 Elite, C64 Ultimate | no | no | see below |
 
 The single-drive and dual-drive 1541 Ultimate-II builds ship as separate
 update images, so which one a cartridge runs depends on the image it was
 flashed with.
-| Ultimate 64, Ultimate 64 Elite, C64 Ultimate | no | no | see below |
 
 **An Ultimate 64, Ultimate 64 Elite or C64 Ultimate has no tape hardware.**
 No top level for them sets those generics (source-read, not traced

@@ -17,7 +17,7 @@ after the first copy, while the KERNAL is still waiting for the second.
 
 VICE's autostart of a ``.tap`` resets, types ``LOAD``, presses play and
 then ``RUN``. The KERNAL reads the pulses: the result depends on the pulse
-lengths, with the device-1 traps on or off.
+lengths, at VICE's default and with ``+trapdevice1``.
 """
 
 from __future__ import annotations
@@ -54,9 +54,9 @@ def test_the_kernal_loads_a_tap_built_from_a_prg(tmp_path):
     if reservation is not None:
         reservation.close()
     # +trapdevice1: no KERNAL traps for device 1, so nothing but the
-    # datasette's pulses can deliver the program. (VICE uses those traps for
-    # .t64 images; the load fails the same way on a mis-timed TAP with them
-    # on or off, so this only pins what was measured.)
+    # datasette's pulses can deliver the program. A mis-timed TAP failed to
+    # load the same way at VICE's default and with this option, so it pins
+    # what was measured. (The binary says the traps are "required for t64".)
     config = ViceConfig(port=port, warp=True, sound=False, prg_path=str(tap),
                         extra_args=["+trapdevice1"])
     failures: list = []
