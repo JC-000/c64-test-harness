@@ -146,7 +146,7 @@ from .ultimate64_storage import (
     storage_put_file,
     storage_put_rom,
 )
-from .ultimate64_temp_gc import lock_held_for
+from .ultimate64_temp_gc import lock_held_for, lock_shell_refusal
 
 __all__ = [
     "FIRMWARE_IMAGE_KINDS",
@@ -882,8 +882,9 @@ def read_wifi_ident(
     (``network_esp32.cc`` ``set_enabled``; #543); on the C64U they switch
     the radio only. Zero ``/Temp``: telnet only.
 
-    The caller must hold *host*'s ``DeviceLock``; without it
-    :class:`RemoteMenuLockError` is raised before anything is sent.
+    The caller must hold *host*'s ``DeviceLock``, or run under a verified
+    lock shell that does; without it :class:`RemoteMenuLockError` is raised
+    before anything is sent.
 
     :param menu_factory: builds the Remote Menu driver; for tests.
     :raises WifiIdentUnreadableError: the row is in a state with no IDENT.
@@ -891,10 +892,11 @@ def read_wifi_ident(
         state in time.
     :raises Ultimate64RemoteMenuError: from the menu driver, as it raised.
     """
-    if not lock_held_for(host):
+    why = None if lock_held_for(host) else lock_shell_refusal(host)
+    if why is not None:
         raise RemoteMenuLockError(
             f"refusing read_wifi_ident on {host}: this process does not hold the "
-            f"device's DeviceLock. Take it first, e.g. "
+            f"device's DeviceLock ({why}). Take it first, e.g. "
             f"DeviceLock({host!r}).acquire_or_raise(timeout=...).")
     menu = (menu_factory or Ultimate64RemoteMenu)(host)
 

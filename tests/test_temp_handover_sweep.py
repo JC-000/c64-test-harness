@@ -424,6 +424,25 @@ def test_an_unlocked_process_is_refused_without_touching_ftp_or_config(device, h
     assert device.temp == ["temp0000", "temp0001"]
 
 
+def test_a_lock_shells_child_is_still_unlocked_to_the_hygiene(device, host, monkeypatch):
+    """#582 let the storage helpers and the Remote Menu accept a verified ancestor lock shell. The /Temp gate did
+    not move: the ledger and its drains belong to the process that holds the lock, so the shell's child is
+    refused before anything is sent, FTP and config untouched."""
+    from lock_shell_fake import fake_lock_shell
+    fake_lock_shell(monkeypatch, host)
+    assert gc_mod.lock_shell_refusal(host) is None          # the shell is genuine: the storage gate would open
+    assert not gc_mod.lock_held_for(host)
+    device.ftp_up = False
+    device.ftp_enable_works = True
+    device.temp[:] = ["temp0000", "temp0001"]
+    with pytest.raises(Ultimate64TempHygieneError, match="DeviceLock"):
+        _client(host).run_prg(PRG)
+    assert device.posts() == []
+    assert device.ftp_sessions() == 0
+    assert device.config_writes() == []
+    assert device.temp == ["temp0000", "temp0001"]
+
+
 def test_an_unlocked_process_is_refused_even_with_ftp_up(device, host):
     device.temp[:] = ["temp0000", "temp0001"]
     with pytest.raises(Ultimate64TempHygieneError, match="DeviceLock"):

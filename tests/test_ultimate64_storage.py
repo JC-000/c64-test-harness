@@ -18,6 +18,8 @@ import pytest
 from c64_test_harness.backends import ultimate64_storage as st
 from c64_test_harness.backends.ultimate64_client import Ultimate64Error
 
+from lock_shell_fake import FORGED_IDS, FORGED_KW, fake_lock_shell, forge
+
 
 class _FakeFTPServer:
     """Filesystem state shared by every fake connection in one test."""
@@ -1402,3 +1404,40 @@ def test_rename_is_exported_at_the_package_root():
     import c64_test_harness
     assert c64_test_harness.storage_rename_file is st.storage_rename_file
     assert "storage_rename_file" in c64_test_harness.__all__ and "storage_rename_file" in st.__all__
+
+
+# -- a lock shell's hold (#582): the gate asks this process's lock first, then a verified ancestor shell --------
+
+@pytest.fixture
+def shell_server():
+    """The fake FTP server with the real lock gate: this process holds no DeviceLock for "dev"."""
+    srv = _FakeFTPServer()
+    fake = type("_BoundFakeFTP", (_FakeFTP,), {"server": srv})
+    with patch.object(st, "FTP", fake):
+        yield srv
+
+
+def test_a_verified_lock_shell_opens_the_session(shell_server, monkeypatch):
+    fake_lock_shell(monkeypatch, "dev")
+    st.storage_put_file("dev", "/SD/x.bin", b"x")
+    assert shell_server.files["/SD/x.bin"] == b"x"
+    st.storage_delete_file("dev", "/SD/x.bin")
+    assert "/SD/x.bin" not in shell_server.files
+
+
+@pytest.mark.parametrize("kw", FORGED_KW, ids=FORGED_IDS)
+def test_a_lock_shell_claim_that_does_not_hold_is_refused_before_connecting(shell_server, monkeypatch, kw):
+    forge(monkeypatch, "dev", kw)
+    with pytest.raises(st.Ultimate64StorageError, match="DeviceLock"):
+        st.storage_put_file("dev", "/SD/x.bin", b"x")
+    with pytest.raises(st.Ultimate64StorageError, match="DeviceLock"):
+        st.storage_get_file("dev", "/SD/x.bin")
+    assert shell_server.connects == 0 and shell_server.files == {}
+
+
+def test_a_lock_shell_for_another_device_is_refused_before_connecting(shell_server, monkeypatch):
+    """The fake names the shell as holder of every lockfile: only C64U_LOCK_HOST keeps it off this device."""
+    fake_lock_shell(monkeypatch, "other-dev")
+    with pytest.raises(st.Ultimate64StorageError, match="DeviceLock"):
+        st.storage_put_file("dev", "/SD/x.bin", b"x")
+    assert shell_server.connects == 0 and shell_server.files == {}

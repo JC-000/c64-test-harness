@@ -1071,6 +1071,25 @@ def test_read_wifi_ident_refuses_without_the_lock_before_any_traffic(rig):
     assert rig.events == [] and made == []
 
 
+def test_read_wifi_ident_runs_under_a_verified_lock_shell(rig, monkeypatch):
+    from lock_shell_fake import fake_lock_shell
+    fake_lock_shell(monkeypatch, HOST)
+    got = _read_ident(rig.events, wifi_seq=[wifi("link-up"), wifi("link-down"), wifi("link-up")])
+    assert got.ident == IDENT and got.toggled is True
+
+
+@pytest.mark.parametrize("shell_host, kw", [(HOST, {"holder": 777}), (HOST, {"ancestors": (100, 200)}),
+                                            ("192.0.2.99", {})],
+                         ids=["not the holder", "not an ancestor", "another device"])
+def test_read_wifi_ident_refuses_an_unverified_lock_shell_before_any_traffic(rig, monkeypatch, shell_host, kw):
+    from lock_shell_fake import fake_lock_shell
+    fake_lock_shell(monkeypatch, shell_host, **kw)
+    made = []
+    with pytest.raises(RemoteMenuLockError):
+        ff.read_wifi_ident(HOST, menu_factory=lambda h: made.append(h) or FakeMenu(rig.events))
+    assert rig.events == [] and made == []
+
+
 def test_read_wifi_ident_cycles_wifi_and_leaves_it_link_up(rig, held):
     got = _read_ident(rig.events, wifi_seq=[wifi("link-up"), wifi("link-down"), wifi("link-up")])
     assert got.ident == IDENT

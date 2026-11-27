@@ -14,7 +14,9 @@ Rules, all enforced before the path is touched:
 * **The caller must hold the device's** ``DeviceLock`` (any lock dir), on
   every firmware grade, for every call, reads included. Storage is device
   state, and the lock is the unit of exclusion (docs/device_locking.md).
-  This is checked before any connection.
+  This is checked before any connection. A child of a lock shell passes
+  when the shell is verified: ``C64U_LOCK_PID`` names an ancestor that is
+  the lockfile's holder (#582, § "Lock shells" there).
 * **Writes never go to** ``/Temp`` **or** ``/Flash``: ``put``, ``mkdir``,
   ``delete`` and ``rmdir`` refuse them, along with names starting with ``.``,
   which no listing would show. ``/Temp`` is the firmware's RAM disk,
@@ -91,6 +93,7 @@ from .ultimate64_temp_gc import (
     FTP_PASSWORD_ENV,
     FTP_USER_ENV,
     lock_held_for,
+    lock_shell_refusal,
 )
 
 __all__ = [
@@ -344,16 +347,18 @@ def _list_root(ftp: FTP) -> tuple[list[str], list[str]]:
 
 @contextmanager
 def _session(host: str, operation: str, port: int, timeout: float) -> Iterator[FTP]:
-    """A logged-in binary-mode FTP session, opened only by a lock holder.
+    """A logged-in binary-mode FTP session, opened only by a lock holder
+    (this process, or its verified lock shell).
 
     Errors raised inside are mapped: the ``_PASS_THROUGH`` OSErrors and
     our own errors propagate unchanged; any other ftplib/socket error
     becomes :class:`Ultimate64StorageError`.
     """
-    if not lock_held_for(host):
+    why = None if lock_held_for(host) else lock_shell_refusal(host)
+    if why is not None:
         raise Ultimate64StorageError(
             f"refusing {operation} on {host}: this process does not hold the "
-            f"device's DeviceLock. Take it first, e.g. "
+            f"device's DeviceLock ({why}). Take it first, e.g. "
             f"DeviceLock({host!r}).acquire_or_raise(timeout=...), or run inside "
             "create_manager(backend='u64')."
         )

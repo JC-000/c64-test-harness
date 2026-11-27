@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts"))
 import jtag_load as jl  # noqa: E402
 import blaster_load_u64 as bl  # noqa: E402
+from lock_shell_fake import FORGED_IDS, FORGED_KW, fake_lock_shell, forge  # noqa: E402
 
 UID = "ABC123"
 HASH = "abc123def"
@@ -414,20 +415,48 @@ def test_a_busy_adapter_releases_the_device_and_runs_no_command(env):
     assert ev == [("acquire", "device"), ("acquire", "adapter"), ("release", "device")]
 
 
-def test_a_lock_shell_holder_is_honoured_and_a_stale_claim_refused(env, monkeypatch):
-    import c64_test_harness.backends.device_lock as dl
+def test_a_verified_lock_shell_is_honoured_and_only_the_route_lock_is_taken(env, monkeypatch):
     ev = env[0]
-    shell = os.getppid()                                # a real ancestor: nothing about the parent walk is faked
-    monkeypatch.setenv("C64U_LOCK_PID", str(shell))
-    monkeypatch.setenv("C64U_LOCK_HOST", "u64e")
-    monkeypatch.setattr(dl, "device_lock_holder", lambda h, lock_dir=None: {"pid": shell})
+    fake_lock_shell(monkeypatch, "u64e")
     assert reload_(env, [info(OLD), info(HASH)])["result"] == "ok"
-    assert ("acquire", "device") not in ev and ("acquire", "adapter") in ev and ("download",) in ev
-    del ev[:]
-    monkeypatch.setattr(dl, "device_lock_holder", lambda h, lock_dir=None: {"pid": 1})
+    assert ("acquire", "device") not in ev and ("release", "device") not in ev
+    assert ("acquire", "adapter") in ev and ("download",) in ev
+
+
+@pytest.mark.parametrize("kw", FORGED_KW, ids=FORGED_IDS)
+def test_a_forged_or_unverifiable_lock_shell_claim_refuses_before_any_lock_ssh_or_device_traffic(env, monkeypatch, kw):
+    ev = env[0]
+    forge(monkeypatch, "u64e", kw)
     with pytest.raises(jl.JtagLoadError) as e:
         reload_(env, [info(OLD), info(HASH)])
-    assert e.value.stage == "lock" and ("download",) not in ev and "scp" not in kinds(ev)
+    assert e.value.stage == "lock" and ev == []
+
+
+def test_a_lock_shell_for_another_device_is_not_this_devices_cover(env, monkeypatch):
+    ev = env[0]
+    fake_lock_shell(monkeypatch, "u64e-full")
+    assert reload_(env, [info(OLD), info(HASH)])["result"] == "ok"
+    assert ev[0] == ("acquire", "device")
+
+
+def test_a_device_lock_this_process_already_holds_is_joined_and_left_held(env, tmp_path, monkeypatch):
+    """A caller that holds the DeviceLock across several loads (allow_nested): real locks, in a private lock dir."""
+    import c64_test_harness.backends.device_lock as dl
+    ev = env[0]
+
+    def real(name, allow_nested=False):
+        return dl.DeviceLock(name, lock_dir=tmp_path / "locks", allow_nested=allow_nested, heartbeat_interval=None)
+    outer = real("u64e")
+    assert outer.acquire(timeout=5)
+    try:
+        monkeypatch.setenv("C64U_LOCK_PID", str(os.getpid()))     # a lock shell calling in-process names itself
+        monkeypatch.setenv("C64U_LOCK_HOST", "u64e")
+        rec = reload_(env, [info(OLD), info(HASH)], lock_factory=real, lock_timeout=2)
+        assert rec["result"] == "ok" and ("download",) in ev
+        assert dl.held_by_this_process_in_any_dir("u64e")         # the load's release did not drop the caller's hold
+    finally:
+        outer.release()
+    assert not dl.held_by_this_process_in_any_dir("u64e")
 
 
 # ---- identity before, and the dark path -----------------------------------------------------------------------

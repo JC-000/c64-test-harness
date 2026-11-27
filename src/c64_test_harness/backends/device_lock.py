@@ -79,6 +79,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 import threading
 import time
 import urllib.error
@@ -2218,6 +2219,71 @@ def held_by_this_process_in_any_dir(device_host: str) -> bool:
             count > 0 and Path(path).name == name
             for path, count in _PROCESS_HELD.items()
         )
+
+
+class LockShellClaimError(RuntimeError):
+    """``C64U_LOCK_PID`` names a process whose hold of the device's ``DeviceLock`` is not this process's cover."""
+
+
+def _parent_pid(pid: int) -> int | None:
+    """The parent of *pid*, or None when it cannot be read (``ps``, so macOS and Linux alike)."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return int(out) if out.isdigit() else None
+
+
+def _is_ancestor(pid: int, max_depth: int = 64) -> bool:
+    """Whether *pid* is this process's parent, grandparent, ... (stops at PID 1 or an unreadable link)."""
+    cur = os.getpid()
+    for _ in range(max_depth):
+        cur = _parent_pid(cur)
+        if cur is None or cur <= 1:
+            return False
+        if cur == pid:
+            return True
+    return False
+
+
+def lock_shell_holds(device_host: str, *, normalize: Callable[[str], str] | None = None) -> bool:
+    """True when a lock shell holds *device_host*'s lock on behalf of this process.
+
+    The convention (``docs/device_locking.md`` § "Lock shells"): an external
+    lock shell holds the ``DeviceLock`` and runs a child command with
+    ``C64U_LOCK_PID=<its pid>`` and ``C64U_LOCK_HOST=<host>``. ``False``
+    when ``C64U_LOCK_PID`` is unset or ``C64U_LOCK_HOST`` names another
+    device. A claim that does not hold raises :class:`LockShellClaimError`
+    and never returns ``False``: the lockfile's current holder must be that
+    PID (``device_lock_holder``, which consults the flock), and that PID
+    must be an ancestor of this process, or the caller would queue behind,
+    or drive past, the very holder it was told about. *normalize* compares
+    the two host spellings (default :func:`normalize_device_host`).
+
+    No network traffic: two environment reads, one lockfile probe and one
+    ``ps`` per ancestor. The answer is a reading of this instant; a gate
+    that depends on it asks again each time.
+    """
+    pid = os.environ.get("C64U_LOCK_PID")
+    if not pid:
+        return False
+    norm = normalize or normalize_device_host
+    shell_host = os.environ.get("C64U_LOCK_HOST")
+    if shell_host and norm(shell_host) != norm(device_host):
+        return False
+    holder = device_lock_holder(device_host)
+    if not (holder and str(holder.get("pid")) == pid):
+        raise LockShellClaimError(
+            f"C64U_LOCK_PID={pid} does not hold the DeviceLock for {device_host} (holder {holder})"
+        )
+    if not (pid.isdigit() and _is_ancestor(int(pid))):
+        raise LockShellClaimError(
+            f"C64U_LOCK_PID={pid} holds the DeviceLock for {device_host} but is not an ancestor "
+            f"of this process ({os.getpid()}): its hold is not for this run"
+        )
+    return True
 
 
 def _foreign_holder_at(path: Path, device_host: str) -> dict | None:
