@@ -1,9 +1,14 @@
-"""Live test for the tape helpers (issue #584) on a real Ultimate.
+"""Live test for the tape helpers (issue #584) on an Ultimate-II+ / II+L.
 
-**Not yet run on a device.** The helpers and their fake are built from the
-firmware source; this module is the first device contact and is what
-records how the menus really look. Read its failures as findings about the
-source reading, not as regressions.
+**Never run on a device, and it cannot run on this project's bench.** Tape
+hardware exists only in the Ultimate-II+ / II+L (and 1541 Ultimate-II)
+builds. On an Ultimate 64, Ultimate 64 Elite or C64 Ultimate the ``rig``
+fixture skips the whole module with the reason ``tape_require_supported``
+gives; no test here passes on a device without a recorder. The harness has
+also never been run against an Ultimate-II+, so a failure in the fixture
+itself (``create_manager``, storage) is as likely as one in the tape code.
+The helpers and their fake are built from the firmware source: read this
+module's failures as findings about that reading, not as regressions.
 
 What it does, on the first removable volume the device lists (never
 ``/Temp``, never ``/Flash``), under ``/<volume>/c64-test-harness-live/``:
@@ -52,10 +57,12 @@ from c64_test_harness.backends.ultimate64_storage import (
 )
 from c64_test_harness.backends.ultimate64_tape import (
     TapeCapture,
+    TapeUnsupportedError,
     tape_capture_start,
     tape_capture_stop,
     tape_load_and_verify,
     tape_play,
+    tape_require_supported,
     tape_status,
     tape_stop,
 )
@@ -91,15 +98,33 @@ def _ready(transport, timeout: float = 25.0) -> None:
     time.sleep(5.0)   # the U64 rewrites $0801 a few seconds after the banner
 
 
+def _delete_capture_when_not_recording(capture: TapeCapture) -> None:
+    """Delete the capture file only after a positive "not recording" reading.
+
+    ``tape_status`` raises on a Tape menu it cannot read, and a file the
+    recorder still holds open must not be deleted under it.
+    """
+    status = tape_status(_HOST)
+    if status.recording:
+        raise RuntimeError(
+            f"{_HOST} still shows a capture running ({status.items}); "
+            f"{capture.path} was left in place")
+    storage_delete_file(_HOST, capture.path, missing_ok=True)
+
+
 @pytest.fixture(scope="module")
 def rig():
-    """A locked device, its target, and the scratch directory.
+    """A locked device with tape hardware, its target, and the scratch directory.
 
     ``create_manager`` holds the ``DeviceLock``; the autouse guard holds it
-    too (``allow_nested``). Teardown stops any capture or playback this
-    module left running and deletes its two files, each step on its own.
+    too (``allow_nested``). A product without a tape recorder (an Ultimate
+    64, 64 Elite or C64 Ultimate) skips the module with the reason
+    ``tape_require_supported`` gives. Teardown stops any capture or playback
+    this module left running and deletes its two files, each step on its
+    own; the capture is deleted only once the device reads "not recording".
     """
     assert _HOST is not None
+    failures: list = []
     with create_manager(backend="u64", u64_hosts=_HOST, lock_timeout=600.0) as mgr:
         with mgr.instance() as tgt:
             vols = storage_writable_volumes(_HOST)
@@ -108,32 +133,35 @@ def rig():
             directory = f"/{vols[0]}/{_DIR}"
             capture = TapeCapture(directory, _CAPTURE_NAME,
                                   f"{directory}/{_CAPTURE_NAME}.tap", True)
-            failures: list = []
+            storage_mkdir(_HOST, directory, exist_ok=True)
             try:
-                storage_mkdir(_HOST, directory, exist_ok=True)
+                product = tape_require_supported(_HOST, directory)
+            except TapeUnsupportedError as exc:
+                pytest.skip(f"no tape hardware on this device: {exc}")
+            try:
                 for name in (f"{_CAPTURE_NAME}.tap", _TAP_NAME):
                     storage_delete_file(_HOST, f"{directory}/{name}", missing_ok=True)
-                yield tgt, directory
+                yield tgt, directory, product
             finally:
                 failures = attempt_steps([
                     ("stop capture", lambda: tape_capture_stop(_HOST, capture, read_file=False)),
                     ("stop tape", lambda: tape_stop(_HOST)),
-                    ("delete capture", lambda: storage_delete_file(
-                        _HOST, capture.path, missing_ok=True)),
+                    ("delete capture", lambda: _delete_capture_when_not_recording(capture)),
                     ("delete tap", lambda: storage_delete_file(
                         _HOST, f"{directory}/{_TAP_NAME}", missing_ok=True)),
                 ])
-            raise_teardown_failures("tape rig teardown", failures)
+    raise_teardown_failures("tape rig teardown", failures)
 
 
 def test_tape_menu_is_idle_and_readable(rig):
+    """Only meaningful because ``rig`` has already seen a capture item."""
     status = tape_status(_HOST)
     assert not status.recording, f"a capture is already running: {status.items}"
     assert not status.playing and not status.paused, f"a tape is loaded: {status.items}"
 
 
 def test_capture_and_start_tape_items_exist_under_their_source_names(rig):
-    tgt, directory = rig
+    tgt, directory, _ = rig
     cap = tape_capture_start(_HOST, directory, _CAPTURE_NAME, dry_run=True)
     assert cap.started is False
     assert not tape_status(_HOST).recording
@@ -146,7 +174,7 @@ def test_capture_and_start_tape_items_exist_under_their_source_names(rig):
 
 
 def test_capture_records_the_stimulus_pulses(rig):
-    tgt, directory = rig
+    tgt, directory, _ = rig
     _ready(tgt.transport)
     stim = build_tape_pulse_stimulus(_PULSES, tap_value=_TAP_VALUE)
     cap = tape_capture_start(_HOST, directory, _CAPTURE_NAME)
@@ -169,7 +197,7 @@ def test_capture_records_the_stimulus_pulses(rig):
 
 
 def test_a_known_program_loads_from_tape(rig):
-    tgt, directory = rig
+    tgt, directory, _ = rig
     prg = tape_test_program()
     path = f"{directory}/{_TAP_NAME}"
     storage_put_file(_HOST, path, build_tap_from_prg(prg), overwrite=True)

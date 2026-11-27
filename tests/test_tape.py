@@ -214,10 +214,14 @@ class _Cpu:
         self.cycles = 0
         self.port_writes: list[tuple[int, int]] = []
         self.d011_writes: list[int] = []
+        self.d011_reads: list[tuple[int, int]] = []
+        self.d015_writes: list[tuple[int, int]] = []
 
     def rd(self, addr):
         if addr == 0xD011:
-            return (self.mem[addr] & 0x7F) | (0x80 if (self.cycles // 9000) & 1 else 0)
+            v = (self.mem[addr] & 0x7F) | (0x80 if (self.cycles // 9000) & 1 else 0)
+            self.d011_reads.append((self.cycles, v))
+            return v
         return self.mem[addr]
 
     def wr(self, addr, v):
@@ -226,6 +230,8 @@ class _Cpu:
             self.port_writes.append((self.cycles, v))
         if addr == 0xD011:
             self.d011_writes.append(v)
+        if addr == 0xD015:
+            self.d015_writes.append((self.cycles, v))
 
     def nz(self, v):
         self.z, self.n = v == 0, bool(v & 0x80)
@@ -336,6 +342,37 @@ def test_the_routine_restores_what_it_changed_and_reports_done(port):
     assert len(edges) == (6 if port & 0x08 else 5)
     # The screen was blanked (bit 4 clear) before the first pulse.
     assert cpu.d011_writes[0] == 0x0B and cpu.d011_writes[-1] == 0x1B
+
+
+def test_sprites_are_off_and_a_new_frame_has_begun_before_the_first_pulse():
+    """What keeps the VIC from stealing cycles: no sprites, and the screen
+    blanked before a frame starts (the blanking takes effect per frame)."""
+    stim = tp.build_tape_pulse_stimulus(4)
+    cpu = _run(stim)
+    first = _rising(cpu)[0]
+    assert [(c < first, v) for c, v in cpu.d015_writes] == [(True, 0x00), (False, 0x81)]
+    blanked_at = None
+    for c, v in cpu.d011_reads:
+        if v & 0x10 == 0:
+            blanked_at = c
+            break
+    assert blanked_at is not None and blanked_at < first
+    seen = [bool(v & 0x80) for c, v in cpu.d011_reads if blanked_at <= c < first]
+    # The raster's high bit was seen set and then clear: a frame boundary
+    # passed between blanking and the first pulse.
+    assert True in seen and seen[-1] is False and seen.index(True) < len(seen) - 1
+
+
+@pytest.mark.parametrize("kw", [
+    {"margin": -1.0}, {"margin": float("nan")}, {"clock_hz": 0}, {"clock_hz": float("inf")},
+    {"clock_hz": -1},
+])
+def test_run_tape_stimulus_refuses_a_wait_that_could_end_early(kw):
+    t = _Transport()
+    stim = tp.build_tape_pulse_stimulus(10)
+    with pytest.raises(ValueError):
+        tp.run_tape_stimulus(t, stim, sleep=lambda s: None, **kw)
+    assert t.log == []
 
 
 def test_done_is_cleared_at_entry_so_a_stale_marker_cannot_pass():

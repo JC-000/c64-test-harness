@@ -228,16 +228,19 @@ from .backends.ultimate64_remote_menu import (
 )
 from .backends.ultimate64_tape import (
     TapeCapture,
+    TapeCaptureNotStoppedError,
     TapeCaptureResult,
     TapeLoadResult,
     TapeMenuRejectedError,
     TapePlayResult,
     TapeStatus,
+    TapeUnsupportedError,
     Ultimate64TapeMenu,
     tape_capture_start,
     tape_capture_stop,
     tape_load_and_verify,
     tape_play,
+    tape_require_supported,
     tape_status,
     tape_stop,
 )
@@ -785,6 +788,9 @@ __all__ = [
     "EspFlashVerifyError",
     # Tape on an Ultimate through the Remote Menu; TAP files; cassette stimulus (#584)
     "TapeCapture",
+    "TapeCaptureNotStoppedError",
+    "TapeUnsupportedError",
+    "tape_require_supported",
     "TapeCaptureResult",
     "TapeLoadResult",
     "TapeMenuRejectedError",

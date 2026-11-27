@@ -1302,17 +1302,23 @@ them apart, and only for this LOAD if you cleared it first: a LOAD that was
 never run (a dropped key, `?SYNTAX ERROR`) leaves the earlier LOAD's pointer.
 Printing has no such check; compare the printer's output file.
 
-### Tape on an Ultimate: capture, playback, stimulus (#584)
+### Tape on an Ultimate-II+: capture, playback, stimulus (#584)
 
-**Source-read, not yet run on a device** (menu names from 1541ultimate
-`69a5f83eb`, 3.x line; the C64U's 1.1.0 was not read). Full page: `docs/tape.md`.
+**Ultimate-II+ / II+L (and 1541 Ultimate-II) only.** An Ultimate 64, Ultimate
+64 Elite or C64 Ultimate has no tape hardware (FPGA option; neither bench
+device lists a Tape menu): there these calls raise `TapeUnsupportedError`.
+Run `tape_require_supported(host, directory)` first; `tape_status` alone
+cannot tell "unsupported" from "idle". **Source-read, never run on a device**
+(menu names from 1541ultimate `69a5f83eb`), and the harness has never been
+run against an Ultimate-II+. Full page: `docs/tape.md`.
 The firmware has no tape REST route, so these go through the Remote Menu
 (telnet) and `storage_*` (FTP). Hold the `DeviceLock` for the whole sequence.
 
 Capture what the C64 writes to the cassette port:
 
 ```python
-stim = build_tape_pulse_stimulus(3000, tap_value=0x30)        # 3000 pulses, 384 cycles each
+tape_require_supported(host, "/USB1/captures")                # raises on a U64 / C64U
+stim = build_tape_pulse_stimulus(3000, tap_value=0x30)        # 3000 pulses, 384 cycles each (CPU at 1 MHz)
 cap = tape_capture_start(host, "/USB1/captures", "run1")      # Tape > "Capture save to TAP"
 try:
     finished = run_tape_stimulus(target, stim, reset=True)    # typed SYS, sleeps, then one read
@@ -1349,6 +1355,10 @@ Rules:
   `run_prg_via_sys`. `cassette_buffer_reserved(transport)` reserves the buffer
   in the transport's `MemoryPolicy` for a block, so a stray
   `transport.write_memory` raises instead of corrupting the header.
+- **Delete a capture only after `tape_status(host).recording` reads False.**
+  A Tape menu with a label the driver does not know raises instead of reading
+  as idle, and `tape_capture_stop` raises `TapeCaptureNotStoppedError` when it
+  stopped nothing but the file's length field is still zero.
 - **Menu items are chosen by name**; `Stop Tape Playback` exists only while
   paused, so `tape_stop` pauses first. `tape_status(host).playing` can stay
   true after a load has finished: it is not a completion signal.

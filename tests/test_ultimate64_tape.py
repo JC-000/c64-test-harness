@@ -36,6 +36,7 @@ from c64_test_harness.backends.ultimate64_storage import StorageEntry
 from c64_test_harness.memory_policy import MemoryPolicy, MemoryPolicyError, MemoryRegion
 
 import remote_menu_fake as rmf
+from lock_shell_fake import FORGED_IDS, FORGED_KW, fake_lock_shell, forge
 from remote_menu_fake import Entry, FakeUltimate
 
 FAST = RemoteMenuTiming(
@@ -115,7 +116,7 @@ def _enters(fake) -> int:
 
 
 def _typed(fake) -> str:
-    return "".join(k for s in fake.sessions for k in s.keys if len(k) == 1 and k != "o")
+    return "".join(k for s in fake.sessions for k in s.keys if len(k) == 1)
 
 
 class _Transport:
@@ -271,7 +272,7 @@ def test_capture_dry_run_highlights_the_item_and_sends_no_enter(make, held):
 
 def test_a_directory_that_is_not_writable_offers_no_capture(make, held):
     fake, menu, storage = make(readonly_paths=("/USB1/Backups/",))
-    with pytest.raises(RemoteMenuNotFoundError, match="no 'Tape' category"):
+    with pytest.raises(ut.TapeUnsupportedError, match="not writable"):
         ut.tape_capture_start(HOST, "/USB1/Backups", "cap", menu=menu)
     assert _enters(fake) == 0 and fake.files == {}
 
@@ -686,3 +687,200 @@ def test_a_file_that_is_not_a_tap_is_refused_before_anything_is_written(make, he
         ut.tape_load_and_verify(t, HOST, "/USB1/wraptor.d64", tp.tape_test_program(),
                                 menu=menu, sleep=lambda s: None)
     assert t.log == [] and fake.connect_attempts == 0
+
+
+# ---------------------------------------------------------------------------
+# Round 2 (PR #589 review)
+# ---------------------------------------------------------------------------
+
+# -- a lock shell stands for the lock (#582) ---------------------------------
+
+def test_a_verified_lock_shell_passes_the_tape_gate(make, monkeypatch):
+    fake, menu, storage = make()
+    fake.recording = "/USB1/x.tap"
+    fake_lock_shell(monkeypatch, HOST)
+    assert ut.tape_status(HOST, menu=menu).recording
+
+
+@pytest.mark.parametrize("kw", FORGED_KW, ids=FORGED_IDS)
+def test_a_forged_lock_shell_is_refused_before_any_connection(make, monkeypatch, kw):
+    fake, menu, storage = make()
+    forge(monkeypatch, HOST, kw)
+    with pytest.raises(RemoteMenuLockError):
+        ut.tape_capture_start(HOST, "/USB1/Backups", "cap", menu=menu)
+    assert fake.connect_attempts == 0 and storage.calls == []
+
+
+# -- a device without tape hardware -------------------------------------------
+
+def test_a_device_without_a_recorder_is_unsupported_not_idle(make, held):
+    fake, menu, storage = make(tape=False)
+    with pytest.raises(ut.TapeUnsupportedError, match="Ultimate 64 Elite") as err:
+        ut.tape_require_supported(HOST, "/USB1/Backups", menu=menu)
+    assert "Ultimate 64 Elite" in err.value.product
+    assert _enters(fake) == 0 and _typed(fake) == ""
+    with pytest.raises(ut.TapeUnsupportedError):
+        ut.tape_capture_start(HOST, "/USB1/Backups", "cap", menu=menu)
+    assert _enters(fake) == 0 and fake.files == {}
+
+
+def test_a_device_with_a_recorder_is_supported(make, held):
+    fake, menu, storage = make()
+    assert "Ultimate 64 Elite" in ut.tape_require_supported(HOST, "/USB1/Backups", menu=menu)
+    assert _enters(fake) == 0
+
+
+def test_require_supported_refuses_temp_and_needs_the_lock(make, held):
+    fake, menu, storage = make()
+    with pytest.raises(ValueError):
+        ut.tape_require_supported(HOST, "/Temp", menu=menu)
+    assert fake.connect_attempts == 0
+    held.release()
+    with pytest.raises(RemoteMenuLockError):
+        ut.tape_require_supported(HOST, "/USB1/Backups", menu=menu)
+    assert fake.connect_attempts == 0
+    assert held.acquire(timeout=5)
+
+
+def test_a_tap_file_without_tape_actions_is_unsupported(make, held):
+    fake, menu, storage = make(tape=False)
+    _, path = _put_tap(fake)
+    with pytest.raises(ut.TapeUnsupportedError, match="Ultimate 64 Elite"):
+        ut.tape_play(HOST, path, menu=menu)
+    assert fake.all_commits() == []
+
+
+def test_load_and_verify_on_an_unsupported_device_types_nothing(make, held):
+    fake, menu, storage = make(tape=False)
+    prg, path = _put_tap(fake)
+    t = _Transport()
+    with pytest.raises(ut.TapeUnsupportedError):
+        ut.tape_load_and_verify(t, HOST, path, prg, menu=menu, sleep=lambda s: None)
+    assert t.log == [] and fake.all_commits() == []
+
+
+# -- labels the driver does not know ------------------------------------------
+
+def test_a_renamed_finish_item_raises_instead_of_reading_as_idle(make, held):
+    fake, menu, storage = make(tape_renames={FINISH: "Finish Recording"})
+    cap_path = "/USB1/Backups/cap.tap"
+    fake.recording = cap_path
+    fake.files[cap_path] = rmf.TAP_HEADER
+    fake.tree["/USB1/Backups/"].append(Entry("cap.tap", "TAP", "0K"))
+    with pytest.raises(RemoteMenuUnexpectedScreenError, match="Finish Recording"):
+        ut.tape_status(HOST, menu=menu)
+    with pytest.raises(RemoteMenuUnexpectedScreenError, match="Finish Recording"):
+        ut.tape_capture_stop(HOST, ut.TapeCapture("/USB1/Backups", "cap", cap_path, True),
+                             menu=menu)
+    assert fake.recording == cap_path and _enters(fake) == 0
+
+
+def test_an_unknown_extra_tape_item_stops_every_tape_call(make, held):
+    fake, menu, storage = make(tape_extra_action="Rewind Tape")
+    fake.playing = "/USB1/known.tap"
+    for call in (lambda: ut.tape_status(HOST, menu=menu),
+                 lambda: ut.tape_stop(HOST, menu=menu),
+                 lambda: ut.tape_capture_start(HOST, "/USB1/Backups", "cap", menu=menu)):
+        with pytest.raises(RemoteMenuUnexpectedScreenError, match="Rewind Tape"):
+            call()
+    assert _enters(fake) == 0 and fake.playing == "/USB1/known.tap"
+
+
+def test_stop_raises_when_finish_is_not_offered_but_the_file_is_still_open(make, held):
+    """No Finish item, yet the file's length field is still zero with data
+    after it or nothing at all: the recorder writes the length when it closes."""
+    fake, menu, storage = make()
+    cap = ut.TapeCapture("/USB1/Backups", "cap", "/USB1/Backups/cap.tap", True)
+    fake.tree["/USB1/Backups/"].append(Entry("cap.tap", "TAP", "0K"))
+    fake.files[cap.path] = rmf.TAP_HEADER + bytes([0x30]) * 512
+    with pytest.raises(ut.TapeCaptureNotStoppedError, match="cap.tap"):
+        ut.tape_capture_stop(HOST, cap, menu=menu)
+    fake.files[cap.path] = rmf.TAP_HEADER
+    with pytest.raises(ut.TapeCaptureNotStoppedError):
+        ut.tape_capture_stop(HOST, cap, menu=menu)
+    assert _enters(fake) == 0
+
+
+# -- the name prompt ------------------------------------------------------------
+
+@pytest.mark.parametrize("mode,exc", [
+    ("none", RemoteMenuUnexpectedScreenError),
+    ("prefilled:old", RemoteMenuUnexpectedScreenError),
+    ("popup:Some message", ut.TapeMenuRejectedError),
+], ids=["no-prompt", "prefilled", "popup-instead"])
+def test_nothing_is_typed_unless_an_empty_prompt_opened(make, held, mode, exc):
+    fake, menu, storage = make(capture_prompt=mode)
+    with pytest.raises(exc) as err:
+        ut.tape_capture_start(HOST, "/USB1/Backups", "cap", menu=menu)
+    assert err.value.enter_sent is False
+    assert _typed(fake) == ""
+    assert _enters(fake) == 1                # the one that chose the item; none after it
+    assert fake.files == {} and fake.recording is None
+    assert "o" not in [k for s in fake.sessions for k in s.keys]
+
+
+def test_require_supported_reads_a_running_capture_as_supported(make, held):
+    fake, menu, storage = make()
+    fake.recording = "/USB1/x.tap"
+    assert ut.tape_require_supported(HOST, "/USB1/Backups", menu=menu)
+
+
+def test_a_popup_over_the_prompt_stops_the_typing(make, held):
+    fake, menu, storage = make(popup_after_chars=(1, "Some device message"))
+    with pytest.raises(RemoteMenuUnexpectedScreenError, match="Some device message") as err:
+        ut.tape_capture_start(HOST, "/USB1/Backups", "foo", menu=menu)
+    assert err.value.enter_sent is False
+    assert _typed(fake) == "f"               # the next letter would have answered the popup
+    assert _enters(fake) == 1 and fake.files == {}
+
+
+def test_a_popup_before_the_committing_enter_stops_it(make, held):
+    fake, menu, storage = make(popup_after_chars=(3, "Some device message"))
+    with pytest.raises(RemoteMenuUnexpectedScreenError, match="Some device message") as err:
+        ut.tape_capture_start(HOST, "/USB1/Backups", "cap", menu=menu)
+    assert err.value.enter_sent is False
+    assert _enters(fake) == 1 and fake.files == {} and fake.recording is None
+
+
+@pytest.mark.parametrize("name", ["Ok", "No", "Nomad", "Yes", "All", "Cancel", "Okay"])
+def test_a_name_that_starts_like_a_button_is_typed_in_full(make, held, name):
+    fake, menu, storage = make()
+    ut.tape_capture_start(HOST, "/USB1/Backups", name, menu=menu)
+    assert _typed(fake) == name
+    assert fake.recording == f"/USB1/Backups/{name}.tap"
+
+
+# -- tape_load_and_verify ---------------------------------------------------------
+
+def test_a_start_that_cannot_be_confirmed_still_stops_the_tape(make, held, monkeypatch):
+    """The ENTER was sent and the tape plays, but the confirming read fails."""
+    fake, menu, storage = make()
+    prg, path = _put_tap(fake)
+    t = _Transport()
+    real = ut.Ultimate64TapeMenu._poll_status
+
+    def poll(self, want, what, timeout):
+        if what.startswith("Start Tape"):
+            raise RemoteMenuVerifyError("slow menu", enter_sent=True)
+        return real(self, want, what, timeout)
+
+    monkeypatch.setattr(ut.Ultimate64TapeMenu, "_poll_status", poll)
+    with pytest.raises(RemoteMenuVerifyError):
+        ut.tape_load_and_verify(t, HOST, path, prg, menu=menu, sleep=lambda s: None)
+    assert ("Start Tape", "/USB1/") in fake.all_commits()
+    assert fake.playing is None                  # stopped on the way out
+    assert "read" not in [e[0] for e in t.log]
+
+
+@pytest.mark.parametrize("kw", [
+    {"found_pause": -1.0}, {"margin": -0.1}, {"found_pause": float("nan")},
+    {"margin": float("inf")}, {"clock_hz": 0}, {"clock_hz": -985248},
+    {"clock_hz": float("nan")}, {"clock_hz": float("inf")}, {"found_pause": "3"},
+])
+def test_a_wait_that_could_end_early_is_refused_before_any_contact(make, held, kw):
+    fake, menu, storage = make()
+    prg, path = _put_tap(fake)
+    t = _Transport()
+    with pytest.raises(ValueError):
+        ut.tape_load_and_verify(t, HOST, path, prg, menu=menu, sleep=lambda s: None, **kw)
+    assert t.log == [] and storage.calls == [] and fake.connect_attempts == 0

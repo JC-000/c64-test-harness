@@ -1,25 +1,51 @@
 # Tape: TAP capture, TAP playback and a cassette-port stimulus
 
-Issue #584. On an Ultimate the tape recorder and the TAP player have no REST
-route, so the harness drives them through the Telnet Remote Menu and checks
-the files over FTP (`storage_*`). The TAP file helpers and the C64-side
-stimulus need no device and work on any backend.
+Issue #584. The firmware's tape recorder and TAP player have no REST route,
+so the harness drives them through the Telnet Remote Menu and checks the
+files over FTP (`storage_*`). The TAP file helpers and the C64-side stimulus
+need no device and work on any backend.
 
-**Evidence grade, read this first.** Nothing here has run on a device yet.
+## Supported products
+
+**The device functions work only on an Ultimate-II+ or II+L (or a 1541
+Ultimate-II) in a real C64.** The recorder and the player are FPGA options
+(`CAPAB_C2N_RECORDER`, `CAPAB_C2N_STREAMER`) that only those builds switch on
+(`g_c2n_recorder` / `g_c2n_streamer` in `u2p_riscv_lattice.vhd`,
+`u2p_riscv.vhd`, `u2p_nios2_solo.vhd`, `ultimate_mb_700a.vhd`,
+`ultimate_riscv_700a.vhd`).
+
+**An Ultimate 64, Ultimate 64 Elite or C64 Ultimate has no tape hardware.**
+No top level for them sets those generics (source-read, not traced
+exhaustively), and neither of this project's bench devices lists a Tape task
+category (bench observation). There the capture and playback calls raise
+`TapeUnsupportedError`, which names the product.
+
+From the browser root an idle device and a product without tape hardware
+look the same (no `Tape` category), so `tape_status` cannot tell them apart.
+`tape_require_supported(host, directory)` can: inside a writable directory a
+product with a recorder always lists a capture item. Call it first.
+
+## Evidence grade
+
+Nothing here has run on a device, and this project's bench has no supported
+product: the live module `tests/test_tape_live.py` (gate `TAPE_LIVE=1`) skips
+there with the unsupported reason and needs an Ultimate-II+ to run. The
+harness itself has never been run against an Ultimate-II+, so its REST
+transport, `create_manager(backend="u64")`, the storage helpers and the
+lock's address handling are unproven there as well.
+
 The menu names and the recorder's behaviour are read from the 1541ultimate
 source at `69a5f83eb` (a working tree on a development branch of the 3.x
-Ultimate line; the tape files were not compared with a release tag). The
-C64 Ultimate's 1.1.0 build was not read: its names may differ. The offline
-tests run against a fake built from that reading. `tests/test_tape_live.py`
-(gate `TAPE_LIVE=1`) is the first device contact, and
+line; the tape files were not compared with a release tag). The offline
+tests run against a fake built from that reading.
 `tests/test_tape_vice_live.py` checks the TAP encoder against a real KERNAL
-under VICE; neither had been run when this page was written.
+under VICE and had not been run when this page was written.
 
 ## The pieces
 
 | What | Where |
 |---|---|
-| `tape_capture_start`, `tape_capture_stop`, `tape_play`, `tape_stop`, `tape_status`, `tape_load_and_verify` | `c64_test_harness.backends.ultimate64_tape` (package-root exports) |
+| `tape_require_supported`, `tape_capture_start`, `tape_capture_stop`, `tape_play`, `tape_stop`, `tape_status`, `tape_load_and_verify` | `c64_test_harness.backends.ultimate64_tape` (package-root exports) |
 | `build_tap_from_prg`, `parse_tap`, `build_tap`, `decode_tap_blocks`, `tape_test_program` | `c64_test_harness.tape` (package-root exports) |
 | `build_tape_pulse_stimulus`, `run_tape_stimulus`, `cassette_buffer_reserved` | `c64_test_harness.tape` (package-root exports) |
 
@@ -30,13 +56,25 @@ under VICE; neither had been run when this page was written.
   included.
 - **Never `/Temp`, never `/Flash`.** A capture target goes through the same
   path check as `storage_put_file` before any menu key. A capture grows with
-  every pulse for as long as it runs, so stop it in a `finally` and keep it
-  short. Do not use a capture to fill a volume.
+  every pulse for as long as it runs, so stop it in a `finally`, keep it
+  short, and use a volume with ample free space. Do not use a capture to fill
+  a volume; what happens when a write fails mid-capture is not handled here.
 - **Never overwrite.** The target name must be free (compared without case).
 - **Menu items by name.** The driver reads the menu, finds the label, moves
   the highlight one key at a time and reads it back. It never counts cursor
   steps. The Tape menu's order is not fixed by the source (two subsystems add
   their items), which is one reason.
+- **Unknown labels stop the call.** The recording / playing / paused state is
+  read from the Tape menu's labels. A menu with any label outside the six in
+  the table below raises `RemoteMenuUnexpectedScreenError`; it is never read
+  as "idle".
+- **A stop that stopped nothing says so.** If `tape_capture_stop` finds no
+  `Finish Rec. to TAP` to choose but the capture's file still has a zero
+  length field, it raises `TapeCaptureNotStoppedError` instead of reporting a
+  status: the recorder writes that field when it closes the file. Do not
+  delete the file until `tape_status` reads "not recording". (An empty
+  capture that was already finished also has a zero field, so a second stop
+  of one raises too.)
 - **One ENTER per change.** The ENTER that creates the capture file, starts
   the tape, or pauses/stops it is sent once and its effect read from a fresh
   connection. It is never resent.
@@ -62,8 +100,8 @@ What follows from the source:
   so from the root the `Tape` category appears only while something is
   recording or playing.
 - **`Capture save to TAP` records the cassette write line**: rising edges,
-  timed in CPU clock ticks, and it pulls the sense line itself while it
-  records. The motor line is not consulted. `Sample tape to TAP` records the
+  timed in phi2 ticks (the C64's 1 MHz clock), and it pulls the sense line
+  itself while it records. The motor line is not consulted. `Sample tape to TAP` records the
   read line (a real datasette) and is not driven by the harness.
 - **Stop is two steps.** `Stop Tape Playback` is offered only while the tape
   is paused, so `tape_stop` chooses Pause, then Stop.
@@ -80,10 +118,11 @@ What follows from the source:
 ```python
 from c64_test_harness import (
     DeviceLock, build_tape_pulse_stimulus, run_tape_stimulus,
-    storage_delete_file, tape_capture_start, tape_capture_stop,
+    storage_delete_file, tape_capture_start, tape_capture_stop, tape_require_supported,
 )
 
 with DeviceLock(host):
+    tape_require_supported(host, "/USB1/captures")             # TapeUnsupportedError on a U64
     stim = build_tape_pulse_stimulus(3000, tap_value=0x30)     # 3000 short pulses
     cap = tape_capture_start(host, "/USB1/captures", "run1")   # -> /USB1/captures/run1.tap
     try:
@@ -103,16 +142,18 @@ the firmware showed, and the parsed file. Statuses: `ok`, `empty` (no pulses),
 `bad-header`, `missing`, `unread`.
 
 A capture name is 1 to 18 letters, digits, `_` or `-`; the firmware adds
-`.tap`. The directory must exist (`storage_mkdir`).
+`.tap`. Nothing is typed unless an empty name prompt opened, and a popup that
+appears over the prompt stops the call before the next key. The directory must exist (`storage_mkdir`).
 
 ### The stimulus
 
 `build_tape_pulse_stimulus(pulses, tap_value=0x30)` returns a small program
 that writes `pulses` pulses on the cassette write line (`$01` bit 3), each
-period exactly `tap_value * 8` CPU cycles. A recorder that times rising edges
-therefore stores `tap_value` for each of the `pulses - 1` intervals between
-them; the Ultimate's recorder adds one interval before the first edge and one
-when it is stopped. The routine sets `SEI`, turns sprites off and blanks the
+period exactly `tap_value * 8` CPU cycles. The recorder times rising edges in
+phi2 ticks, so **with the CPU at 1 MHz** it stores `tap_value` for each of the
+`pulses - 1` intervals between them, plus one interval before the first edge
+and one when it is stopped. At any other CPU speed a CPU cycle is not a phi2
+tick and the stored values differ. The routine sets `SEI`, turns sprites off and blanks the
 screen so the VIC steals no cycles, drives the line low before the first
 pulse, and puts `$D011`, `$D015` and `$01` back (if bit 3 was set on entry,
 which is not the KERNAL's default, putting it back is one more rising edge).
@@ -141,8 +182,10 @@ res = tape_load_and_verify(target.transport, host, "/USB1/captures/known.tap", p
 assert res.loaded, res.check
 ```
 
-`tape_load_and_verify` zeroes the load area and `$AE/$AF`, types `LOAD`,
-starts the tape, sleeps for the tape's playing time plus an allowance, stops
+`tape_load_and_verify` first checks, with a dry run, that the device offers
+`Start Tape` for the file, and refuses a negative or non-finite `found_pause`
+or `margin` (either would end the wait early). Then it zeroes the load area
+and `$AE/$AF`, types `LOAD`, starts the tape, sleeps for the tape's playing time plus an allowance, stops
 the tape, and then calls `prg.verify_load`. `loaded` needs the end pointer at
 the program's end, every byte equal, and no tape error bit in ST (`$3C`).
 For a tape the KERNAL sets the end pointer from the tape header before it
@@ -160,8 +203,8 @@ side yourself.
 On an Ultimate a REST memory or screen read stops the 6510 while the rest of
 the machine runs on (#573). For IEC that is measured. For tape it is reasoned
 from the same mechanism and not measured: the KERNAL times tape pulses with a
-CIA timer, and the recorder times the write line in CPU clock ticks, so a
-stopped CPU stretches the pulse being read or written.
+CIA timer, and the recorder times the write line in phi2 ticks, which run on
+while the CPU is stopped, so a stop stretches the pulse being read or written.
 
 So: between typing `LOAD` (or starting the stimulus) and the end of the wait,
 do not call `read_memory`, `read_bytes`, `wait_for_text`, `wait_for_memory`,

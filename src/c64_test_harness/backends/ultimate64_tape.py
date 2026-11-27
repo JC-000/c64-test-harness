@@ -1,4 +1,19 @@
-"""An Ultimate's tape recorder and TAP player, driven through the Remote Menu (issue #584).
+"""The Ultimate-II+'s tape recorder and TAP player, driven through the Remote Menu (issue #584).
+
+**Supported products: the Ultimate-II+ and II+L (and the 1541 Ultimate-II),
+in a real C64.** The recorder and the player are FPGA options
+(``CAPAB_C2N_RECORDER``, ``CAPAB_C2N_STREAMER``) that only those builds'
+top levels switch on (``g_c2n_recorder`` / ``g_c2n_streamer`` in
+``u2p_riscv_lattice.vhd``, ``u2p_riscv.vhd``, ``u2p_nios2_solo.vhd``,
+``ultimate_mb_700a.vhd``, ``ultimate_riscv_700a.vhd``). **An Ultimate 64,
+Ultimate 64 Elite or C64 Ultimate has neither**: no top level for them sets
+the generics (source-read, not traced exhaustively), and neither of this
+project's bench devices lists a Tape task category (bench observation). On
+those products every capture or playback call here raises
+:class:`TapeUnsupportedError`; :func:`tape_require_supported` is the check to
+run first. The harness has never been run against an Ultimate-II+ at all, so
+its REST transport, ``create_manager(backend="u64")``, the FTP storage
+helpers and the lock's address handling are unproven there too.
 
 The firmware has no REST route for tape. The recorder and the player are
 reached from its menus, so this module drives them over the Telnet Remote
@@ -49,7 +64,9 @@ How the firmware behaves, as read:
   playing (``TaskMenu::init`` lists a category with at least one shown and
   enabled action).
 * **"Capture save to TAP" times rising edges of the cassette write line**
-  in CPU clock ticks and pulls the sense line itself while it records
+  in phi2 ticks (the C64's 1 MHz clock; ``c2n_record.vhd`` counts
+  ``phi2_tick``), which equal CPU cycles only while the CPU runs at 1 MHz,
+  and pulls the sense line itself while it records
   (``TapeRecorder::start`` selects ``REC_SELECT_WRITE``; ``c2n_record.vhd``:
   ``pull_sense <= sel and enabled``). The motor line is not consulted (its
   term is commented out there). So a routine that toggles bit 3 of ``$01``
@@ -74,8 +91,10 @@ How the firmware behaves, as read:
   first, reads included, before any FTP or telnet connection.
 * **A capture never targets** ``/Temp`` **or** ``/Flash``. The target path
   goes through the same check as ``storage_put_file`` before any menu
-  action. A capture grows for as long as it runs: stop it, and keep it
-  short. An existing file is never overwritten: the name must be free.
+  action. A capture grows for as long as it runs: stop it, keep it short,
+  and use a volume with ample free space (what happens when a write fails
+  mid-capture is outside this driver). An existing file is never
+  overwritten: the name must be free.
 * **A name is 1..18 letters, digits,** ``_`` **or** ``-``; the firmware adds
   ``.tap``. Each character typed into the prompt is read back before the
   next, and the ENTER that creates the file is sent once.
@@ -93,11 +112,12 @@ How the firmware behaves, as read:
 **Evidence.** Every menu name, prompt and popup above is read from the
 1541ultimate source tree at 69a5f83eb (a working tree on a development
 branch of the 3.x Ultimate line; the tape files were not compared with a
-release tag). The C64 Ultimate's 1.1.0 build was not read: its names may
-differ, and nothing here has been tried on either product. What
-``set_extension`` does with a name that already has an extension was not
-read either, which is one reason names with a ``.`` are refused. The live
-module ``tests/test_tape_live.py`` is the first device contact.
+release tag). Nothing here has been tried on any device, and this project's
+bench has no product with tape hardware, so the live module
+``tests/test_tape_live.py`` has nowhere to run here: it skips with
+:class:`TapeUnsupportedError`'s reason on the bench devices. A Tape menu
+with a label outside the ones above stops the call
+(``RemoteMenuUnexpectedScreenError``) rather than being read as a state.
 """
 
 from __future__ import annotations
@@ -108,7 +128,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from ..tape import PAL_CLOCK_HZ, TapFile, cassette_buffer_reserved, parse_tap
+from ..tape import PAL_CLOCK_HZ, TapFile, cassette_buffer_reserved, check_wait, parse_tap
 from ..verify import LoadCheck, PrgFile
 from . import ultimate64_remote_menu as _rm
 from .ultimate64_remote_menu import (
@@ -129,21 +149,24 @@ from .ultimate64_storage import (
     storage_get_file,
     storage_list_dir,
 )
-from .ultimate64_temp_gc import lock_held_for
+from .ultimate64_temp_gc import lock_held_for, lock_shell_refusal
 
 __all__ = [
     "TAPE_NAME_MAX",
     "TapeCapture",
+    "TapeCaptureNotStoppedError",
     "TapeCaptureResult",
     "TapeLoadResult",
     "TapeMenuRejectedError",
     "TapePlayResult",
     "TapeStatus",
+    "TapeUnsupportedError",
     "Ultimate64TapeMenu",
     "tape_capture_start",
     "tape_capture_stop",
     "tape_load_and_verify",
     "tape_play",
+    "tape_require_supported",
     "tape_status",
     "tape_stop",
 ]
@@ -157,6 +180,13 @@ ACTION_PAUSE = "Pause Tape Playback"
 ACTION_RESUME = "Resume Tape Playback"
 ACTION_STOP = "Stop Tape Playback"
 ACTION_START_TAPE = "Start Tape"
+ACTION_SAMPLE = "Sample tape to TAP"
+#: Every label the Tape category can hold, by the source. A submenu with any
+#: other label is not read as a state: the call stops.
+KNOWN_TAPE_ACTIONS = frozenset({
+    ACTION_SAMPLE, ACTION_CAPTURE, ACTION_FINISH, ACTION_PAUSE, ACTION_RESUME, ACTION_STOP})
+#: What the player adds to a ``.tap`` file's context menu.
+TAP_FILE_ACTIONS = frozenset({"Enter (index)", "Run Tape", "Write to Tape", ACTION_START_TAPE})
 NAME_PROMPT = "Give name for tap file.."
 CAPTURE_STOPPED = "Tape capture stopped."
 
@@ -193,6 +223,28 @@ class TapeMenuRejectedError(Ultimate64RemoteMenuError):
         self.popup = popup
 
 
+class TapeUnsupportedError(Ultimate64RemoteMenuError):
+    """The device shows no tape recorder, or no TAP player.
+
+    The tape hardware is an FPGA option of the Ultimate-II+ / II+L (and
+    1541 Ultimate-II) builds. An Ultimate 64, Ultimate 64 Elite or C64
+    Ultimate has neither part, so its menus never list the items.
+    ``product`` is the title the device's screen shows.
+    """
+
+    def __init__(self, message: str, *, product: str,
+                 screen: tuple[str, ...] | None = None) -> None:
+        super().__init__(message, screen=screen)
+        self.product = product
+
+
+class TapeCaptureNotStoppedError(Ultimate64RemoteMenuError):
+    """``tape_capture_stop`` found no "Finish Rec. to TAP" to choose, but the
+    capture's file still has a zero length field: the recorder writes that
+    field when it closes the file, so the file may still be open. Do not
+    delete it; read :func:`tape_status` and the device's own menu first."""
+
+
 @dataclass(frozen=True)
 class TapeStatus:
     """What the Tape task menu shows from the browser root.
@@ -202,6 +254,10 @@ class TapeStatus:
     is loaded and not paused; the firmware keeps it loaded until its last
     pulse has been played or it is stopped, so it can stay ``True`` after
     the C64 has finished loading.
+
+    **An empty** ``items`` **does not show that the device has tape
+    hardware**: an idle device and a product without it look the same from
+    the root. :func:`tape_require_supported` tells them apart.
     """
 
     items: tuple[str, ...]
@@ -314,10 +370,26 @@ def read_string_box(scr: TelnetScreen, prompt: str) -> str | None:
 
 
 def _require_lock(host: str, operation: str) -> None:
-    if not lock_held_for(host):
+    """The same gate as the Remote Menu driver and the storage helpers: this
+    process holds the lock, or is the child of a verified lock shell (#582)."""
+    why = None if lock_held_for(host) else lock_shell_refusal(host)
+    if why is not None:
         raise RemoteMenuLockError(
             f"refusing {operation} on {host}: this process does not hold the device's "
-            f"DeviceLock. Take it first, e.g. DeviceLock({host!r}).acquire_or_raise(timeout=...).")
+            f"DeviceLock ({why}). Take it first, e.g. "
+            f"DeviceLock({host!r}).acquire_or_raise(timeout=...).")
+
+
+def _product(rows: tuple[str, ...]) -> str:
+    """The product title on the screen's first row, without its ``***`` marks."""
+    parts = [p.strip() for p in rows[0].split("***") if p.strip()] if rows else []
+    return parts[0] if parts else (rows[0].strip() if rows else "unknown product")
+
+
+_UNSUPPORTED_HINT = (
+    "The tape recorder and TAP player are FPGA options of the Ultimate-II+ / II+L "
+    "(and 1541 Ultimate-II); an Ultimate 64, Ultimate 64 Elite or C64 Ultimate has "
+    "neither.")
 
 
 def _capture_target(directory: str, name: str) -> tuple[list[str], str]:
@@ -394,7 +466,34 @@ class Ultimate64TapeMenu(Ultimate64RemoteMenu):
         if sub is None or sub.labels == top.labels:
             raise RemoteMenuNavigationError(
                 "RIGHT on 'Tape' opened no submenu; not resending", screen=view.rows)
+        unknown = [label for label in _rm._labels(sub) if label not in KNOWN_TAPE_ACTIONS]
+        if unknown:
+            raise RemoteMenuUnexpectedScreenError(
+                f"the Tape menu on {self.host} holds {unknown}, which this driver does not "
+                f"know (it knows {sorted(KNOWN_TAPE_ACTIONS)}). Its state cannot be read "
+                "from labels it does not know, so nothing was chosen.", screen=view.rows)
         return sub
+
+    def _overlay_popup(self, sess: Any) -> Popup | None:
+        """A popup on the screen that is not the name prompt itself.
+
+        ``read_view`` takes a three-row box whose last row holds only button
+        words for a popup, and the name prompt is one while the text typed
+        so far is ``No`` or ``Ok``.
+        """
+        popup = self._view(sess).popup
+        if popup is not None and popup.message == NAME_PROMPT:
+            return None
+        return popup
+
+    def _refuse_overlay(self, sess: Any, what: str, doing: str) -> None:
+        popup = self._overlay_popup(sess)
+        if popup is not None:
+            self._seen_messages.append(popup.message)
+            raise RemoteMenuUnexpectedScreenError(
+                f"{what}: a popup {popup.message!r} {list(popup.buttons)} is on the screen "
+                f"{doing}; a key now would answer it. Stopping; closing the session "
+                "cancels the prompt.", screen=self._view(sess).rows)
 
     def _await_popup(self, sess: Any, timeout: float, *, expected: bool) -> Popup | None:
         """Read the committing session for a popup.
@@ -450,6 +549,34 @@ class Ultimate64TapeMenu(Ultimate64RemoteMenu):
         finally:
             sess.close()
 
+    def require_recorder(self, parts: list[str]) -> str:
+        """Check that the Tape menu inside directory *parts* offers a capture.
+
+        With a recorder, a writable directory always lists the Tape
+        category with "Capture save to TAP" (or "Finish Rec. to TAP" while
+        one runs). Returns the product title; chooses nothing.
+
+        :raises TapeUnsupportedError: no Tape category there, or one without
+            the recorder's items.
+        """
+        what = f"tape support check in /{'/'.join(parts)}"
+        sess = self._open(what)
+        try:
+            shown = self._enter_directory(sess, parts)
+            sub = self._open_tape(sess, what)
+            view = self._view(sess)
+            product = _product(view.rows)
+            labels = _rm._labels(sub) if sub is not None else ()
+            if ACTION_CAPTURE not in labels and ACTION_FINISH not in labels:
+                raise TapeUnsupportedError(
+                    f"{product} at {self.host} offers no tape capture in {shown} (Tape menu: "
+                    f"{list(labels) or 'not listed'}). {_UNSUPPORTED_HINT} On a product that "
+                    "has a recorder this means the directory is not writable.",
+                    product=product, screen=view.rows)
+            return product
+        finally:
+            sess.close()
+
     # -- capture --------------------------------------------------------------
     def start_capture(self, parts: list[str], name: str, *, dry_run: bool = False,
                       verify_timeout: float | None = None) -> tuple[str, ...]:
@@ -467,10 +594,12 @@ class Ultimate64TapeMenu(Ultimate64RemoteMenu):
             self._enter_directory(sess, parts)
             sub = self._open_tape(sess, what)
             if sub is None:
-                raise RemoteMenuNotFoundError(
-                    f"{what}: the task menu lists no 'Tape' category here (the recorder's "
-                    "items are disabled where the path is not writable)",
-                    screen=self._view(sess).rows)
+                view = self._view(sess)
+                product = _product(view.rows)
+                raise TapeUnsupportedError(
+                    f"{what}: {product} lists no 'Tape' category in this directory. "
+                    f"{_UNSUPPORTED_HINT} On a product that has a recorder this means the "
+                    "directory is not writable.", product=product, screen=view.rows)
             menu = self._highlight(sess, ACTION_CAPTURE, "the Tape task menu")
             labels = _rm._labels(menu)
             if dry_run:
@@ -488,6 +617,9 @@ class Ultimate64TapeMenu(Ultimate64RemoteMenu):
                     f"{ACTION_CAPTURE!r}; nothing typed, not resending", screen=view.rows)
             for i, ch in enumerate(name):
                 sess.type_char(ch)
+                # Checked after every character, so also before the next one
+                # and before the ENTER below.
+                self._refuse_overlay(sess, what, f"after typing {name[:i + 1]!r}")
                 shown = read_string_box(sess.screen, NAME_PROMPT)
                 if shown != name[:i + 1]:
                     raise RemoteMenuNavigationError(
@@ -549,8 +681,15 @@ class Ultimate64TapeMenu(Ultimate64RemoteMenu):
         once = _rm._Once()
         sess = self._open(what)
         try:
-            self._navigate(sess, path)
-            self._open_menu(sess, path)
+            entry = self._navigate(sess, path)
+            offered = self._open_menu(sess, path)
+            if entry.kind.upper() == "TAP" and not TAP_FILE_ACTIONS & set(offered.labels):
+                view = self._view(sess)
+                product = _product(view.rows)
+                raise TapeUnsupportedError(
+                    f"{what}: {product} offers no tape action for a .tap file (its menu: "
+                    f"{list(offered.labels)}). {_UNSUPPORTED_HINT}",
+                    product=product, screen=view.rows)
             menu = self._highlight(sess, ACTION_START_TAPE, path)
             if dry_run:
                 return TapePlayResult(path, True, menu.labels, False, None)
@@ -614,9 +753,32 @@ def _menu(host: str, menu: Ultimate64TapeMenu | None) -> Ultimate64TapeMenu:
 
 
 def tape_status(host: str, *, menu: Ultimate64TapeMenu | None = None) -> TapeStatus:
-    """What the Tape task menu shows: recording, playing, paused."""
+    """What the Tape task menu shows: recording, playing, paused.
+
+    A device with no tape hardware reads the same as an idle one (no Tape
+    category at the root); see :func:`tape_require_supported`. A Tape menu
+    with a label this driver does not know raises
+    ``RemoteMenuUnexpectedScreenError`` rather than being read as a state.
+    """
     _require_lock(host, "tape_status")
     return _menu(host, menu).tape_status()
+
+
+def tape_require_supported(host: str, directory: str, *,
+                           menu: Ultimate64TapeMenu | None = None) -> str:
+    """Check that the device has a tape recorder; return its product title.
+
+    Browses into *directory* (a writable one: not ``/Temp``, not ``/Flash``)
+    and reads the Tape task menu there, where a product with a recorder
+    always lists a capture item. Chooses nothing and creates nothing.
+
+    :raises TapeUnsupportedError: the menu offers no capture there. The
+        error names the product. On an Ultimate 64 / 64 Elite / C64 Ultimate
+        this is always the answer.
+    """
+    _require_lock(host, "tape_require_supported")
+    parts, _ = _capture_target(directory, "probe")
+    return _menu(host, menu).require_recorder(parts)
 
 
 def tape_capture_start(host: str, directory: str, name: str, *, dry_run: bool = False,
@@ -685,6 +847,13 @@ def tape_capture_stop(host: str, capture: TapeCapture, *, read_file: bool = True
         tap = parse_tap(raw)
     except ValueError:
         return TapeCaptureResult(path, len(raw), "bad-header", None, None, was_recording, popup)
+    if not was_recording and tap.declared_length == 0:
+        raise TapeCaptureNotStoppedError(
+            f"{path} on {host}: the Tape menu offered no {ACTION_FINISH!r}, so nothing was "
+            f"stopped, yet the file's length field is 0 ({len(tap.data)} data bytes follow). "
+            "The recorder writes that field when it closes the file, so the capture may "
+            "still be open. Not reporting a status; do not delete the file until the "
+            "device shows that it is not recording.")
     if not tap.length_matches:
         status = "length-mismatch"
     elif not tap.data:
@@ -739,9 +908,17 @@ def tape_load_and_verify(transport: Any, host: str, tap_path: str, prg: PrgFile,
     before the first write until the tape has been stopped; a policy that
     refuses the two clearing writes stops the call before anything is typed.
 
-    If the tape cannot be started (:class:`TapeMenuRejectedError`, a
-    verify error) the exception propagates with the C64 still waiting at
-    ``PRESS PLAY ON TAPE``: reset it.
+    Before anything is written or typed, a dry run of "Start Tape" checks
+    that the file is there and the device has a player
+    (:class:`TapeUnsupportedError` otherwise), and a negative or non-finite
+    *found_pause* / *margin* or a non-positive *clock_hz* is a ``ValueError``
+    before any device contact: either would end the wait early.
+
+    If starting the tape then fails, the exception propagates after the
+    tape has been stopped (*stop_after*). The ``LOAD`` was typed, so the C64
+    is either still at ``PRESS PLAY ON TAPE`` (a refusal popup) or was
+    loading when the tape stopped (the ENTER was sent but could not be
+    confirmed): reset it either way.
 
     *found_pause* is not measured: 15 s is a generous allowance for the
     KERNAL's wait after ``FOUND`` (it continues by itself). *start* is where
@@ -751,19 +928,23 @@ def tape_load_and_verify(transport: Any, host: str, tap_path: str, prg: PrgFile,
     from ..keyboard import send_text
     from ..memory import write_bytes
 
+    check_wait(clock_hz=clock_hz, found_pause=found_pause, margin=margin)
     _require_lock(host, "tape_load_and_verify")
     _rm._split_path(tap_path)
     tap = parse_tap(storage_get_file(host, tap_path))
     where = prg.load_address if start is None else start
     driver = _menu(host, menu)
+    # Before anything is written or typed: the file is there and the device
+    # offers "Start Tape" for it (TapeUnsupportedError if it has no player).
+    driver.start_tape(tap_path, dry_run=True)
     waited = _LEAD_IN_SECONDS + tap.duration_seconds(clock_hz) + found_pause + margin
     after: TapeStatus | None = None
     with cassette_buffer_reserved(transport):
         write_bytes(transport, where, bytes(len(prg.data)))
         write_bytes(transport, 0x00AE, b"\x00\x00")
         send_text(transport, "LOAD\r")
-        play = driver.start_tape(tap_path)
         try:
+            play = driver.start_tape(tap_path)
             # #573: wait the cassette I/O out; no memory or screen read until it is over.
             sleep(waited)
         finally:

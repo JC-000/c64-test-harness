@@ -12,8 +12,9 @@ Three things live here, all pure Python:
   cassette write line, and :func:`run_tape_stimulus`, which starts it and
   waits it out.
 
-Driving an Ultimate's tape recorder and TAP player is in
-:mod:`c64_test_harness.backends.ultimate64_tape`.
+Driving the tape recorder and TAP player of an Ultimate-II+ / II+L is in
+:mod:`c64_test_harness.backends.ultimate64_tape` (the Ultimate 64 family
+and the C64 Ultimate have no tape hardware).
 
 **The cassette buffer is the KERNAL's during tape I/O.** ``LOAD`` and
 ``SAVE`` on device 1 keep the tape header in ``$033C-$03FB``, where the
@@ -39,6 +40,7 @@ Nothing here has been loaded by a real KERNAL or recorded by a device yet.
 
 from __future__ import annotations
 
+import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -64,6 +66,7 @@ __all__ = [
     "build_tap_from_prg",
     "build_tape_pulse_stimulus",
     "cassette_buffer_reserved",
+    "check_wait",
     "decode_tap_blocks",
     "parse_tap",
     "run_tape_stimulus",
@@ -82,6 +85,22 @@ TAP_LONG = 0x56
 #: PAL and NTSC CPU clocks in Hz, for turning cycles into seconds.
 PAL_CLOCK_HZ = 985248
 NTSC_CLOCK_HZ = 1022727
+
+def check_wait(*, clock_hz: float, **seconds: float) -> None:
+    """Refuse wait parameters that could end a cassette wait early (#573).
+
+    *clock_hz* must be a positive finite number, and every keyword in
+    *seconds* a finite number that is not negative. Raises ``ValueError``.
+    """
+    def number(v: object) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+    if not number(clock_hz) or clock_hz <= 0:
+        raise ValueError(f"clock_hz must be a positive finite number, not {clock_hz!r}")
+    for label, value in seconds.items():
+        if not number(value) or value < 0:
+            raise ValueError(f"{label} must be a finite number of seconds >= 0, not {value!r}")
+
 
 #: The KERNAL's tape buffer, ``$033C-$03FB``, as a ``MemoryRegion``.
 CASSETTE_BUFFER = MemoryRegion(
@@ -424,9 +443,11 @@ def build_tape_pulse_stimulus(pulses: int = 2000, *, tap_value: int = TAP_SHORT,
                               load_address: int = 0x0801) -> TapeStimulus:
     """A routine that writes *pulses* pulses on the cassette write line.
 
-    Each period is exactly ``tap_value * 8`` CPU cycles, so a recorder that
-    times one edge of the write line (``$01`` bit 3) stores *tap_value* for
-    every interval. The routine sets ``SEI``, turns sprites off and blanks
+    Each period is exactly ``tap_value * 8`` CPU cycles. A recorder that
+    times one edge of the write line (``$01`` bit 3) in phi2 ticks, as the
+    Ultimate-II+'s does, stores *tap_value* for every interval **only while
+    the CPU runs at 1 MHz**: on a turbo-capable machine set to a higher
+    speed a CPU cycle is no longer a phi2 tick. The routine sets ``SEI``, turns sprites off and blanks
     the screen (then waits for the next frame) so the VIC steals no cycles,
     drives the line low, toggles bit 3 of ``$01`` and leaves every other bit
     as it found it, restores ``$D011``, ``$D015`` and ``$01`` (if bit 3 was
@@ -539,7 +560,9 @@ def run_tape_stimulus(target: Any, stimulus: TapeStimulus, *, reset: bool = Fals
 
     #573: nothing is read while the pulses are written. On an Ultimate a
     REST read stops the 6510, and a recorder that times the write line in
-    CPU clock ticks would store that pulse too long.
+    phi2 ticks (the 1 MHz clock, which runs on) would store that pulse too
+    long. *margin* and *clock_hz* are checked first (:func:`check_wait`): a
+    negative or non-finite value would end the wait early.
 
     Pass ``reset=True`` unless the machine is at a BASIC prompt. On VICE
     the machine runs after this call (``run_prg_via_sys`` resumes it) and is
@@ -550,6 +573,7 @@ def run_tape_stimulus(target: Any, stimulus: TapeStimulus, *, reset: bool = Fals
     from .execute import run_prg_via_sys
     from .memory import read_bytes
 
+    check_wait(clock_hz=clock_hz, margin=margin)
     run_prg_via_sys(target, stimulus.prg, sys_addr=stimulus.sys_address, reset=reset)
     # #573: wait the pulse train out; no read until it has finished.
     sleep(stimulus.duration_seconds(clock_hz) + 0.05 + margin)

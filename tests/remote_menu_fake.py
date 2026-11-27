@@ -253,6 +253,16 @@ class FakeUltimate:
     :param box_drops: characters the name prompt drops (a key lost on the way).
     :param tape_category_runs_capture: opening the Tape category opens the
         name prompt at once (a build whose category holds a single action).
+    :param tape_renames: ``{source label: label drawn}`` for Tape actions, a
+        build that words an item differently.
+    :param tape_extra_action: one more shown, enabled Tape action that does
+        nothing, under a label the source does not have.
+    :param capture_prompt: what choosing a capture item draws: ``"normal"``
+        (the empty name prompt), ``"none"`` (nothing changes),
+        ``"prefilled:<text>"`` (the prompt with text already in it) or
+        ``"popup:<text>"`` (an ``Ok`` popup instead).
+    :param popup_after_chars: ``(n, text)``: once *n* characters are in the
+        name prompt, an ``Ok`` popup opens over it.
     """
 
     def __init__(
@@ -299,6 +309,10 @@ class FakeUltimate:
         tap_start: str = "ok",
         box_drops: str = "",
         tape_category_runs_capture: bool = False,
+        tape_renames: dict[str, str] | None = None,
+        tape_extra_action: str | None = None,
+        capture_prompt: str = "normal",
+        popup_after_chars: tuple[int, str] | None = None,
     ) -> None:
         self.title = title
         self.root = root if root is not None else [
@@ -371,6 +385,10 @@ class FakeUltimate:
         self.tap_start = tap_start
         self.box_drops = box_drops
         self.tape_category_runs_capture = tape_category_runs_capture
+        self.tape_renames = dict(tape_renames or {})
+        self.tape_extra_action = tape_extra_action
+        self.capture_prompt = capture_prompt
+        self.popup_after_chars = popup_after_chars
         #: file contents by path, for the storage side of a test
         self.files: dict[str, bytes] = {}
         #: path of the capture file being recorded, or None
@@ -496,7 +514,10 @@ class FakeUltimate:
             recorder = [(finish, True)]
         else:
             recorder = [(sample, writable), (capture, writable)]
-        return recorder + player if self.tape_recorder_first else player + recorder
+        acts = recorder + player if self.tape_recorder_first else player + recorder
+        if self.tape_extra_action is not None:
+            acts.append((self.tape_extra_action, True))
+        return [(self.tape_renames.get(label, label), en) for label, en in acts]
 
     def tasks(self, path: str = "/") -> list[tuple[str, list[tuple[str, bool]]]]:
         """Categories as ``(name, [(label, enabled)])``, shown items only."""
@@ -791,6 +812,9 @@ class _Session:
         if len(name) == 1 and 32 <= ord(name) < 127:
             if name not in self.dev.box_drops and len(text) < 22:
                 self.box[1] = text + name
+            after = self.dev.popup_after_chars
+            if after is not None and len(self.box[1]) == after[0]:
+                self.popup = (after[1], ["Ok"])
             self.redraw()
 
     def start_capture(self, label: str, text: str) -> None:
@@ -813,9 +837,23 @@ class _Session:
 
     def run_tape_action(self, label: str) -> None:
         dev = self.dev
+        label = {drawn: source for source, drawn in dev.tape_renames.items()}.get(label, label)
+        if label == dev.tape_extra_action:
+            self.log.commits.append((f"Tape/{label}", "tasks"))
+            self.tasks = None
+            self.sub = None
+            self.redraw()
+            return
         if label in TAPE_RECORDER_ACTIONS[:2]:
             # request_file: the name prompt first; nothing exists until it ends.
-            self.box = [TAPE_PROMPT, "", label]
+            mode = dev.capture_prompt
+            if mode == "none":
+                return
+            if mode.startswith("popup:"):
+                self.popup = (mode.split(":", 1)[1], ["Ok"])
+            else:
+                text = mode.split(":", 1)[1] if mode.startswith("prefilled:") else ""
+                self.box = [TAPE_PROMPT, text, label]
             self.redraw()
             return
         self.tasks = None
