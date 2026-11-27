@@ -492,7 +492,10 @@ python -m c64_test_harness.tools.flash_esp --host <ethernet address> \
 ```
 
 It checks the image with `esp_image.py`, takes the `DeviceLock`
-(`--lock-timeout`, else `U64_DEVICE_LOCK_TIMEOUT`, else 60 s), uploads to
+(`--lock-timeout`, else `U64_DEVICE_LOCK_TIMEOUT`, else 60 s; joined when
+the calling process already holds it, and not taken under a verified lock
+shell, whose claim is refused with exit 2 before anything is sent when it
+does not hold: `docs/device_locking.md` § "Lock shells"), uploads to
 `--dest` (refusing an existing file), reads the upload back, reads the ident
 with `read_wifi_ident` before and after (never inside the flash window),
 runs `flash_esp`, and prints one result line. It deletes the upload, and its
@@ -528,22 +531,24 @@ before the ENTER. Upstream, GideonZ/1541ultimate#1121 (issue) and its fix
 #1122 (PR), both open, make the action check the image and stop reporting
 "Success!" for an empty or truncated file.
 
-## Bench scripts: RAM-run, JTAG load, outlet power cycle
+## Bench scripts: RAM-run, JTAG load, Blaster reload, outlet power cycle
 
-Three scripts under `scripts/` (#571) load firmware without writing flash,
+Four scripts under `scripts/` (#571, #583) load firmware without writing flash,
 or power-cycle a device. They are bench tools, not test steps. Each acts
 only on a device bound in the local `~/.config/c64-test-harness/bench.toml`
 (`[devices.<unique_id>]` tables; `C64_BENCH_BINDINGS_FILE` overrides the
 path) and refuses any other: `ram_run = true` for `ram_run_u64.py`;
 `jtag_adapter_location` and `jtag_adapter_baud` for `jtag_load.py`, plus
-`jtag_scan_only = true` for a device that may only be scanned; `outlet` and
-`outlet_kind` for `power_outlet.py`. The host still reaches its
+`jtag_scan_only = true` for a device that may only be scanned;
+`jtag_blaster_ssh` and `jtag_blaster_cable` for `blaster_load_u64.py`;
+`outlet` and `outlet_kind` for `power_outlet.py`. The host still reaches its
 `unique_id` through `devices.toml`, so a `bench.toml` table alone binds
-nothing; `docs/development.md` has the details. Each takes the device's `DeviceLock`
-(`ram_run_u64.py` takes its own and refuses to run inside a lock shell;
-`jtag_load.py` and `power_outlet.py` also accept a hold by a verified
-ancestor lock shell). All three are gated by
-`tests/test_u64_runner_script_gates.py`.
+nothing; `docs/development.md` has the details. Each takes the device's `DeviceLock`,
+joins it when the calling process already holds it (`allow_nested`), and
+takes none under a verified ancestor lock shell (since #582 that includes
+`ram_run_u64.py`: the storage helpers and the Remote Menu driver it uses
+accept the same claim; `docs/device_locking.md` § "Lock shells"). All
+four are gated by `tests/test_u64_runner_script_gates.py`.
 
 - **`ram_run_u64.py run HOST IMAGE --sha256 H --expect-hash G`** runs a
   U64E application from RAM through Run Update, with no flash write. The
@@ -565,6 +570,96 @@ ancestor lock shell). All three are gated by
   FPGA's IDCODE, the user ID after the load, and the device's identity and
   git hash afterwards. `$ESP_JTAG_DIR` and `$C64U_TESTS_DIR` must be set;
   neither has a default.
+- **`blaster_load_u64.py load HOST ELF --sha256 H --expect-hash G`**
+  (#583) reloads a U64 or U64E application over JTAG with
+  `nios2-download -g`, through a USB-Blaster-compatible adapter (USB id
+  `09fb:6001`) served by `jtagd`. No flash write; the flashed application
+  comes back with a power cycle. It is the way back for a U64E whose
+  application hangs, and it has a path for a box that no longer answers.
+  - **The route is local configuration.** The Quartus tools run where the
+    adapter is attached (here an x86 Linux VM) and are reached over `ssh`
+    and `scp`. Required in the device's `bench.toml` table:
+    `jtag_blaster_ssh` (the ssh destination; an `ssh_config` Host alias
+    keeps the port, user and key out of the table) and `jtag_blaster_cable`
+    (text that the one cable's name in `jtagconfig` must contain). Optional:
+    `jtag_blaster_ssh_port`, `jtag_blaster_ssh_identity`,
+    `jtag_blaster_env` (shell text run before every command there, for
+    `PATH`; its own output is discarded) and `jtag_blaster_jtagd_start` (the command that starts `jtagd`
+    when it is not running; without it a stopped `jtagd` is a refusal).
+    On a VM where `jtagd` exits when idle, bind
+    `jtag_blaster_jtagd_start = "jtagconfig"`: a plain `jtagconfig` starts
+    `jtagd` by itself. Measured on this bench's VM, 2026-11-27, n=1:
+    without the key the preflight refused (`jtagd is not running`), with
+    it the preflight started `jtagd` and passed. Another lane saw the same
+    auto-start earlier.
+    ssh runs with `BatchMode=yes`, so it never prompts, and host-key
+    checking stays on: the far side's host key must already be in
+    `known_hosts` for the bound destination and port (and the key file
+    usable without a passphrase prompt), or the first step refuses with
+    `[remote] tools: exit 255 ... Host key verification failed` (seen on
+    the first live preflight, 2026-11-27; nothing is touched).
+    A harness tree older than this change refuses a device table that
+    carries the `jtag_blaster_*` keys (an unknown key fails the whole
+    file), so add them only once every tree that reads the file knows
+    them, or point older trees elsewhere with `C64_BENCH_BINDINGS_FILE`.
+  - **These keys are a capability of their own.** `jtag_scan_only = true`
+    and `jtag_adapter_*` describe the esp-jtag adapter of `jtag_load.py`.
+    The Blaster script neither reads nor lifts them: a table may carry
+    both, and `jtag_load.py` still refuses to load that device.
+  - **Refused before any lock or command:** a device without the binding,
+    `ssh` or `scp` missing, an ELF whose SHA-256 is not the pinned one (a
+    copy is hashed, and the copy is what gets uploaded), anything but a
+    little-endian Nios II ELF32 with its segments below `0x1000000` and its
+    entry inside one, and an ELF that does not embed the first 7 digits of
+    `--expect-hash`.
+  - **Under the device's `DeviceLock` and the route's own lock:** `/v1/info`
+    must answer as the bound `unique_id` and a U64 product. With `--dark`
+    the box counts as dark after three unanswered requests in a row; if it
+    answers on the way, it is identity-checked and the load goes on as for
+    any answering box.
+  - **Preflight, before the Nios is paused:** the tools exist on the far
+    side; no `nios2-download` or `jtagconfig` is still running there (a
+    refusal, never a kill: a download whose ssh timed out here can outlive
+    the locks); the work directory is one from this script's own `mktemp`
+    template; the upload hashes to the pin there; with `--srec-sha256`, so does
+    the far side's `nios2-elf-objcopy` SREC conversion; no stray
+    `nios2-gdb-server` or `nios2-elf-gdb` (a refusal, or killed with
+    `--kill-stray-gdb`); `jtagd` runs; `jtagconfig -n` shows exactly one
+    cable, the bound one, with exactly one `5CE` device and a `Nios II`
+    node, and no line the parser does not know. The layout is observed:
+    one `jtagconfig -n` listing recorded from the bench on 2026-11-27 (a
+    cable line, a device line, a `Node` line and a `Design hash` line) is
+    a test fixture, and any other line is a refusal.
+    `--preflight-only` stops here.
+  - **One download, never retried.** A non-zero exit or a timeout is a
+    failure that says to stop: the Nios may be left paused.
+  - **Afterwards** `/v1/info` must answer with the bound `unique_id`, a U64
+    product and the expected git hash. Another device answering is an
+    identity failure.
+  - **What the result proves** (`restart_proof`; #570 is the limit):
+    `hash-change` when the device reported another hash before and the
+    expected one afterwards (a device that reported none has not changed
+    it); `no-answer-before` when three requests in a row went unanswered
+    before the load and the bound device answers afterwards; `rest-drop`
+    when the hash could not be seen to change and three requests in a row
+    then went unanswered. Each request waits up to 5 s and they are 1 s
+    apart, so that is an outage of roughly 3 to 18 s; a network fault of
+    that length looks the same. Without it the load ends `ok-unproven`
+    with exit 3: the tool returned 0 and the device answers, as it did
+    before. **Measured on a U64E (3.15a), 2026-11-27, n=1:** a same-hash
+    reload of an answering box ended exactly so (`rest_drop_seen` false
+    over the 90 s watch, download exit 0): that same-image JTAG reload
+    was not proven by a REST outage (n=1); expect exit 3.
+  - `--dry-run` runs the local checks, prints the plan and sends nothing.
+    Exit 0 is loaded and proven, 3 loaded but unproven, 2 refused or failed.
+  - **Run on a device once** (U64E 3.15a, 2026-11-27, n=1 per case):
+    dry run, preflight, a hash-changing load (up after 22.1 s), a load
+    back under a DeviceLock the caller already held (21.5 s), and a
+    same-hash load from a child of a lock shell (unproven, as above). Not
+    run on a device: `--dark` on a box that does not answer, `--srec-sha256`,
+    `--kill-stray-gdb`, a failed download. Those are exercised against
+    fakes only; the lane's out-of-tree loader the sequence was read from
+    reported 7 recoveries of a hung box on 2026-11-25.
 - **`power_outlet.py cycle HOST`** cold-cycles a device through a switched
   outlet (Shelly gen2 or Tasmota), bound in `bench.toml`. Whether it powers
   the device off first is decided under the lock from the `/v1/info`

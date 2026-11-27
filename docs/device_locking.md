@@ -505,7 +505,9 @@ shell must keep the DeviceLock for that host for as long as the child
 runs. The lockfile's holder must be the shell's PID, so the shell takes
 the lock itself; a holder it merely knows about does not count.
 
-`scripts/_u64_host.py` checks the claim in `lock_shell_holds(host)`:
+`lock_shell_holds(host)` checks the claim. It lives in
+`backends/device_lock.py`, and `scripts/_u64_host.py` re-exports it for the
+scripts:
 
 - `C64U_LOCK_PID` unset: there is no shell, so the answer is False.
 - `C64U_LOCK_HOST` set and naming another device: False.
@@ -523,13 +525,51 @@ that factory; `tests/test_u64_runner_script_gates.py` accepts that shape in
 place of a `with hold_device_lock(...)` block. It takes no lock and waits
 for nothing.
 
-A lock shell's hold does not satisfy the harness's own gates. The FTP
-storage helpers, the Remote Menu driver and the `/Temp` hygiene check
-`lock_held_for`, which only sees locks this process holds. That is why
-`scripts/ram_run_u64.py`, which uses both, refuses to run under a lock
-shell for its device and takes its own lock instead.
-`scripts/volatile_load.py`'s session holds the lock in-process for the
-same reason, so helpers called in its body pass.
+Since #582 three of the harness's own gates accept the same verified claim:
+the FTP storage helpers (`storage_*`), the Remote Menu driver
+(`Ultimate64RemoteMenu`, every call) and `read_wifi_ident`. Each asks
+`lock_held_for` first, which sees only locks this process holds, and then
+`lock_shell_refusal(host)` (`backends/ultimate64_temp_gc.py`), which is
+`None` only when `lock_shell_holds(host)` is true. They ask before every
+FTP session and every telnet session, so a shell that drops the lock
+mid-run stops its child at the next one. A claim that does not hold, or a
+shell bound to another device, is refused as an unlocked process is:
+`Ultimate64StorageError` or `RemoteMenuLockError`, before any connection.
+
+That is what lets `scripts/ram_run_u64.py` and
+`python -m c64_test_harness.tools.flash_esp` run under a lock the caller
+already holds, like `jtag_load.py`, `blaster_load_u64.py` and
+`power_outlet.py`:
+
+- **In process.** A driver that holds the `DeviceLock` and calls
+  `ram_run(...)` or `flash_esp.main([...])` is joined (`allow_nested=True`)
+  and still holds the lock on return. This process's own hold is asked
+  first and the environment second, so a driver that is also a lock shell
+  for its children, with its own PID in `C64U_LOCK_PID`, is not refused as
+  a non-ancestor.
+- **Under a lock shell.** Neither tool takes a lock. Each verifies the
+  claim once before anything is sent (`ram_run`: `JtagLoadError("lock")`
+  before the `/v1/info` read; `flash_esp`: exit 2), so a forged or stale
+  claim cannot stop a run after its upload.
+- **A shell bound to another device** covers nothing: the tool takes this
+  device's lock itself, and waits or times out as any other process would.
+
+The scripts can run against another harness tree (`C64_HARNESS_SRC`). A
+tree from before #582 has no `lock_shell_holds`: with `C64U_LOCK_PID`
+unset the scripts lock as they always did, and with it set the claim
+cannot be verified and is refused (`LockShellClaimError`).
+
+**The `/Temp` hygiene does not accept a lock shell.** Its ledger, its
+handover sweep and its release drains belong to the process that holds the
+flock, so `Ultimate64Client` and `liveness_probe` still gate on
+`lock_held_for` alone. On a leak-prone device a lock shell's child is
+refused every attachment-creating request (`Ultimate64TempHygieneError`),
+exactly as an unlocked process is. `flash_firmware` and
+`save_config_item_to_flash` also still need the lock held by this process.
+
+`scripts/volatile_load.py`'s session takes the lock in this process (or leaves it to a verified lock
+shell), so the storage helpers, the Remote Menu driver and the bench scripts called in its
+body pass their checks either way.
 
 ## Related
 

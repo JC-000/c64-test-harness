@@ -42,6 +42,7 @@ from c64_test_harness.backends.ultimate64_remote_menu import (
     read_view,
 )
 
+from lock_shell_fake import FORGED_IDS, FORGED_KW, fake_lock_shell, forge
 from remote_menu_fake import Entry, FakeUltimate
 
 FIXTURES = Path(__file__).parent / "fixtures" / "remote_menu"
@@ -1042,3 +1043,31 @@ def test_a_task_key_that_opens_nothing_stops_before_any_enter(make, held):
         menu.run_task("Printer", "Reset")
     assert ei.value.enter_sent is False
     assert fake.all_commits() == []
+
+
+# -- a lock shell's hold (#582) ---------------------------------------------
+def test_a_verified_lock_shell_opens_a_session(make, monkeypatch):
+    fake, menu = make()
+    fake_lock_shell(monkeypatch, "127.0.0.1")
+    assert menu.wifi_status().state == "link-up"
+    assert len(fake.sessions) == 1
+
+
+@pytest.mark.parametrize("kw", FORGED_KW, ids=FORGED_IDS)
+def test_a_lock_shell_claim_that_does_not_hold_is_refused_before_connecting(make, monkeypatch, kw):
+    fake, menu = make()
+    forge(monkeypatch, "127.0.0.1", kw)
+    with pytest.raises(RemoteMenuLockError, match="DeviceLock"):
+        menu.wifi_status()
+    with pytest.raises(RemoteMenuLockError, match="DeviceLock"):
+        menu.run_update("/USB1/vf_ue.u64", confirm_device_powers_off=True)
+    assert fake.connect_attempts == 0 and fake.sessions == []
+
+
+def test_a_lock_shell_for_another_device_is_refused_before_connecting(make, monkeypatch):
+    """The fake names the shell as holder of every lockfile: only C64U_LOCK_HOST keeps it off this device."""
+    fake, menu = make()
+    fake_lock_shell(monkeypatch, "192.0.2.99")
+    with pytest.raises(RemoteMenuLockError, match="DeviceLock"):
+        menu.wifi_status()
+    assert fake.connect_attempts == 0
