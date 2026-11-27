@@ -12,6 +12,14 @@ which adapter or outlet, lives in local configuration:
     jtag_scan_only = true                 # jtag_load.py scan-u64e only: the device is never loaded
     outlet = "http://<plug address>"      # power_outlet.py: the switched outlet ...
     outlet_kind = "shelly-gen2"           # ... and its API ("shelly-gen2" or "tasmota")
+    volatile_baseline_image = "<path>"    # volatile_load.py: the image volatile_restore returns to (a RAM-run
+                                          # .u64 for the U64 line, a one-record ultimate.app for the C64U class) ...
+    volatile_baseline_sha256 = "<64 hex>" # ... its SHA-256 ...
+    volatile_baseline_git_hash = "<hex>"  # ... and the git hash /v1/info reports when it runs (7-40 hex digits)
+    volatile_baseline_bit = "<path>"      # C64U class: the baseline's FPGA bitstream ...
+    volatile_baseline_bit_sha256 = "<64 hex>"   # ... and its SHA-256
+    volatile_baseline_jtag_image = "<path>"     # U64 line, optional: what a U64 JTAG reload loads into a dark box
+    volatile_baseline_jtag_sha256 = "<64 hex>"  # ... and its SHA-256
 
 It is a separate file from the alias map (devices.toml), which every harness version reads and which refuses any key
 but ``hosts``. Only these scripts read this one. A host is resolved to its unique_id through the alias map, as
@@ -29,6 +37,10 @@ from pathlib import Path
 
 BENCH_FILE_ENV = "C64_BENCH_BINDINGS_FILE"
 
+def _is_hex(v, lo: int, hi: int) -> bool:
+    return isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{%d,%d}" % (lo, hi), v) is not None
+
+
 #: key -> (check, what it must be)
 _CHECKS = {
     "ram_run": (lambda v: isinstance(v, bool), "true or false"),
@@ -37,6 +49,13 @@ _CHECKS = {
     "jtag_scan_only": (lambda v: isinstance(v, bool), "true or false"),
     "outlet": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
     "outlet_kind": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
+    "volatile_baseline_image": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
+    "volatile_baseline_sha256": (lambda v: _is_hex(v, 64, 64), "64 hex digits"),
+    "volatile_baseline_git_hash": (lambda v: _is_hex(v, 7, 40), "7 to 40 hex digits"),
+    "volatile_baseline_bit": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
+    "volatile_baseline_bit_sha256": (lambda v: _is_hex(v, 64, 64), "64 hex digits"),
+    "volatile_baseline_jtag_image": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
+    "volatile_baseline_jtag_sha256": (lambda v: _is_hex(v, 64, 64), "64 hex digits"),
 }
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,15}$")     # as device_aliases._ID_RE
 

@@ -528,6 +528,8 @@ storage helpers, the Remote Menu driver and the `/Temp` hygiene check
 `lock_held_for`, which only sees locks this process holds. That is why
 `scripts/ram_run_u64.py`, which uses both, refuses to run under a lock
 shell for its device and takes its own lock instead.
+`scripts/volatile_load.py`'s session holds the lock in-process for the
+same reason, so helpers called in its body pass.
 
 ## Related
 

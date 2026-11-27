@@ -41,6 +41,16 @@ def test_a_bound_device_is_read_in_either_case(bench):
                                         "outlet_kind": "shelly-gen2"}
 
 
+def test_the_volatile_baseline_keys_are_read(bench):
+    """volatile_load.py's baseline: an image path, its SHA-256 and the git hash it reports, per device."""
+    table = {"volatile_baseline_image": "/images/base.u64", "volatile_baseline_sha256": "AB" * 32,
+             "volatile_baseline_git_hash": "0123abc", "volatile_baseline_bit": "/images/base.bit",
+             "volatile_baseline_bit_sha256": "cd" * 32, "volatile_baseline_jtag_image": "/images/base.elf",
+             "volatile_baseline_jtag_sha256": "ef" * 32}
+    bench.write_text("[devices.abc123]\n" + "".join(f'{k} = "{v}"\n' for k, v in table.items()))
+    assert bb.bench_table("abc123") == table
+
+
 def test_an_unbound_device_has_no_table(bench):
     bench.write_text(GOOD)
     assert bb.bench_table("fed789") == {}
@@ -63,8 +73,15 @@ def test_a_missing_file_is_refused_and_named(bench):
     '[devices.abc123]\njtag_adapter_location = " "\n',
     '[devices.abc123]\noutlet = ""\n',
     "[devices.abc123]\noutlet_kind = 2\n",
+    '[devices.abc123]\nvolatile_baseline_image = ""\n',
+    '[devices.abc123]\nvolatile_baseline_sha256 = "abc123"\n',
+    '[devices.abc123]\nvolatile_baseline_git_hash = "main"\n',
+    "[devices.abc123]\nvolatile_baseline_bit = 7\n",
+    f'[devices.abc123]\nvolatile_baseline_bit_sha256 = "{"g" * 64}"\n',
+    f'[devices.abc123]\nvolatile_baseline_jtag_sha256 = "{"0" * 63}"\n',
 ], ids=["ram-run-str", "ram-run-int", "scan-only-int", "baud-str", "baud-bool", "baud-zero", "location-int",
-        "location-blank", "outlet-empty", "kind-int"])
+        "location-blank", "outlet-empty", "kind-int", "baseline-image-empty", "baseline-sha-short",
+        "baseline-hash-not-hex", "baseline-bit-int", "baseline-bit-sha-not-hex", "baseline-jtag-sha-short"])
 def test_a_value_of_the_wrong_type_is_refused(bench, text):
     bench.write_text(text)
     with pytest.raises(bb.BenchBindingError, match="must be"):

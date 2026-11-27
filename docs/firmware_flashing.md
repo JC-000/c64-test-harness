@@ -582,3 +582,95 @@ ancestor lock shell). All three are gated by
     outlet is switched.
   - The outlet is never left off: any error after switching it off
     switches it back on before raising.
+
+### One volatile load for both products: `volatile_load.py` (#585)
+
+`scripts/volatile_load.py` sits above `ram_run_u64.py` and `jtag_load.py`
+and gives both products one call, one result shape and one way back. It
+adds no device I/O of its own beyond a bodyless `/v1/info` read; each
+backend keeps its gates.
+
+```python
+from volatile_load import VolatileImage, volatile_load, volatile_restore, volatile_session
+
+image = VolatileImage(path, sha256, expected_hash)              # U64 line: a RAM-run .u64
+image = VolatileImage(app, sha256, expected_hash, bit=bit, bit_sha256=bit_sha)   # C64U class
+
+with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock across all of it
+    ...                                                         # the rows; s.load_image(other) for a second image
+```
+
+- **Backend.** Chosen under the lock from the `/v1/info` product:
+  "Ultimate 64" and "Ultimate 64 Elite" get `ram_run`; "C64 Ultimate" and
+  "Ultimate 64-II" get `jtag_cold`. Any other product is refused. A box
+  that does not answer three polls is dark: the backend then follows the
+  image's family, which the device's `bench.toml` table must enable, and
+  the identity is checked on `/v1/info` after the load. A dark U64-line
+  box needs a JTAG reload through a second adapter (#583). That backend is
+  an injected callable (`u64_jtag_reload`, default
+  `volatile_load.U64_JTAG_RELOAD`); while none is wired it is a refusal,
+  and the way back is a power cycle.
+- **Images.** Checked before any lock, upload or JTAG pin. Exactly two
+  shapes pass: a RAM-run file (`check_ramrun_image`) for the U64 line, and
+  a one-record `ultimate.app` at `0x30000` plus the FPGA `.bit` for the
+  C64U class (the DRAM image is extracted with `payload_from_app`; a raw
+  `ultimate.bin` carries nothing to check and is not accepted). Update
+  images, `.cfw` files and garbage are refused, and so is any file holding
+  an updater prompt string or the SILENT marker, whatever its shape. The
+  image's family must be the device's.
+- **Result.** `VolatileResult`: `ok`, `backend`, `family`, `product`,
+  `git_hash` (reported by the running firmware), `expect_git_hash`,
+  `loaded`, `dark_before`, `hash_changed`, `restart_proof`, `timings`
+  (seconds per step), `notes`, and the backend's own `record`. A failure
+  raises `VolatileLoadError` (a `JtagLoadError`, so it has a `stage`) whose
+  `result` has `ok` False.
+- **What a result proves.** After a load the running firmware must report
+  the bound `unique_id`, a product of the image's family and the expected
+  hash. `restart_proof` then says why the load is believed to have
+  started: `hash-change`; `jtag-reconfigured` (the FPGA was reloaded cold
+  and the user ID read back, which also covers a same-hash load);
+  `dark-then-answering`; or `none`. A same-hash RAM-run cannot be proven
+  (#570) and `ram_run` refuses it. So `volatile_restore` on a U64-line
+  device that already reports the baseline hash loads nothing and returns
+  `loaded` False with `restart_proof` `none`: the hashes agree, and that
+  the running image is the baseline file is not proven. For the same
+  reason `baseline_first` fails on a U64-line device that already reports
+  the baseline hash, and the image is then never loaded.
+- **Baseline and restore.** `volatile_restore(host)` loads the baseline
+  from the device's `bench.toml` table: `volatile_baseline_image`,
+  `volatile_baseline_sha256`, `volatile_baseline_git_hash`; for the C64U
+  class also `volatile_baseline_bit` and `volatile_baseline_bit_sha256`;
+  optionally, for the U64 line, `volatile_baseline_jtag_image` and
+  `volatile_baseline_jtag_sha256` (what a JTAG reload loads into a dark
+  box). The session restores on the way out, also when the load or the
+  body raised. The body's exception propagates; a restore failure is then
+  kept in `session.restore_error` and logged, and is raised only after a
+  clean body.
+- **Lock.** The session takes the `DeviceLock` in this process
+  (`allow_nested`), so the backends and the harness helpers called in the
+  body join it. Under a verified lock shell it takes none
+  (`session.lock_in_process` is False): the C64U path works, the RAM-run
+  path is refused by `ram_run_u64.py`, and helpers that check for an
+  in-process hold refuse (#582).
+- **Adapter.** Only the adapter bound to the device in `bench.toml` is
+  used. A `jtag_scan_only` device and a missing binding are refused before
+  the lock, and so is a `JTAG_USB_LOCATION` that names another location
+  (`jtag_load.py` alone lets that variable override the table).
+  `jtag_load.py`'s live IDCODE gate still runs before the FPGA is touched.
+- **Cold only.** The C64 Ultimate load is always cold. There is no option
+  for a warm load, and `JTAG_LOAD_WARM` is not honoured here.
+- **JTAG timeout.** `jtag_timeout` under 300 s is refused. The cold
+  esp-jtag load is never interrupted by this code; the value is the budget
+  handed to the U64 JTAG reload.
+- **Storage.** On the RAM-run path the only storage writes are
+  `ram_run_u64.py`'s: one staged file, deleted again.
+
+```
+volatile_load.py load    HOST IMAGE --sha256 H --expect-hash G [--bit F --bit-sha256 H]
+                         [--jtag-image F --jtag-sha256 H] [--baseline-first] [--dry-run] [--record F]
+volatile_load.py restore HOST [--dry-run] [--record F]
+```
+
+`--dry-run` prints the plan (the backend's own dry run included) and
+takes no lock and opens no client, storage, menu or adapter. Nothing here
+has run against a device: every test uses stand-ins.
