@@ -592,6 +592,10 @@ four are gated by `tests/test_u64_runner_script_gates.py`.
     `jtag_blaster_jtagd_start` is normally left unset and the remedy for
     the refusal is to run `jtagconfig` on the far side once.
     ssh runs with `BatchMode=yes`, so it never prompts.
+    A harness tree older than this change refuses a device table that
+    carries the `jtag_blaster_*` keys (an unknown key fails the whole
+    file), so add them only once every tree that reads the file knows
+    them, or point older trees elsewhere with `C64_BENCH_BINDINGS_FILE`.
   - **These keys are a capability of their own.** `jtag_scan_only = true`
     and `jtag_adapter_*` describe the esp-jtag adapter of `jtag_load.py`.
     The Blaster script neither reads nor lifts them: a table may carry
