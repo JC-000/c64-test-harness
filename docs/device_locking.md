@@ -538,7 +538,8 @@ shell bound to another device, is refused as an unlocked process is:
 
 That is what lets `scripts/ram_run_u64.py` and
 `python -m c64_test_harness.tools.flash_esp` run under a lock the caller
-already holds, like `jtag_load.py` and `power_outlet.py`:
+already holds, like `jtag_load.py`, `blaster_load_u64.py` and
+`power_outlet.py`:
 
 - **In process.** A driver that holds the `DeviceLock` and calls
   `ram_run(...)` or `flash_esp.main([...])` is joined (`allow_nested=True`)

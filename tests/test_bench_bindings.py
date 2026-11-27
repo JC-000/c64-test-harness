@@ -41,6 +41,16 @@ def test_a_bound_device_is_read_in_either_case(bench):
                                         "outlet_kind": "shelly-gen2"}
 
 
+def test_the_blaster_route_keys_are_read(bench):
+    bench.write_text('[devices.abc123]\njtag_blaster_ssh = "user@vm.example"\njtag_blaster_ssh_port = 2200\n'
+                     'jtag_blaster_ssh_identity = "~/.ssh/k"\njtag_blaster_cable = "USB-Blaster"\n'
+                     'jtag_blaster_env = ". /opt/env.sh"\njtag_blaster_jtagd_start = "jtagd --user-start"\n')
+    assert bb.bench_table("abc123") == {
+        "jtag_blaster_ssh": "user@vm.example", "jtag_blaster_ssh_port": 2200, "jtag_blaster_ssh_identity": "~/.ssh/k",
+        "jtag_blaster_cable": "USB-Blaster", "jtag_blaster_env": ". /opt/env.sh",
+        "jtag_blaster_jtagd_start": "jtagd --user-start"}
+
+
 def test_an_unbound_device_has_no_table(bench):
     bench.write_text(GOOD)
     assert bb.bench_table("fed789") == {}
@@ -63,8 +73,26 @@ def test_a_missing_file_is_refused_and_named(bench):
     '[devices.abc123]\njtag_adapter_location = " "\n',
     '[devices.abc123]\noutlet = ""\n',
     "[devices.abc123]\noutlet_kind = 2\n",
+    '[devices.abc123]\njtag_blaster_ssh = "-lroot"\n',      # would be read by ssh as an option
+    '[devices.abc123]\njtag_blaster_ssh = "vm; reboot"\n',
+    '[devices.abc123]\njtag_blaster_ssh = "vm host"\n',
+    '[devices.abc123]\njtag_blaster_ssh = "vm$(x)"\n',
+    '[devices.abc123]\njtag_blaster_ssh = "vm`x`"\n',
+    '[devices.abc123]\njtag_blaster_ssh = "vm|x"\n',
+    '[devices.abc123]\njtag_blaster_ssh = ""\n',
+    "[devices.abc123]\njtag_blaster_ssh = 22\n",
+    '[devices.abc123]\njtag_blaster_ssh_port = "2200"\n',
+    "[devices.abc123]\njtag_blaster_ssh_port = 70000\n",
+    "[devices.abc123]\njtag_blaster_ssh_port = true\n",
+    '[devices.abc123]\njtag_blaster_ssh_identity = "-F/x"\n',
+    '[devices.abc123]\njtag_blaster_cable = " "\n',
+    "[devices.abc123]\njtag_blaster_env = 1\n",
+    '[devices.abc123]\njtag_blaster_jtagd_start = ""\n',
 ], ids=["ram-run-str", "ram-run-int", "scan-only-int", "baud-str", "baud-bool", "baud-zero", "location-int",
-        "location-blank", "outlet-empty", "kind-int"])
+        "location-blank", "outlet-empty", "kind-int", "blaster-ssh-option", "blaster-ssh-shell", "blaster-ssh-space",
+        "blaster-ssh-subshell", "blaster-ssh-backtick", "blaster-ssh-pipe", "blaster-ssh-empty",
+        "blaster-ssh-int", "blaster-port-str", "blaster-port-range", "blaster-port-bool", "blaster-identity-option",
+        "blaster-cable-blank", "blaster-env-int", "blaster-jtagd-empty"])
 def test_a_value_of_the_wrong_type_is_refused(bench, text):
     bench.write_text(text)
     with pytest.raises(bb.BenchBindingError, match="must be"):
