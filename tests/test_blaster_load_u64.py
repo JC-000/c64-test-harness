@@ -7,6 +7,7 @@ ssh destination and the cable name are fake; the bench's real ones live only in 
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 
@@ -19,7 +20,7 @@ import blaster_load_u64 as bl  # noqa: E402
 UID = "ABC123"
 HASH = "abc123def"
 OLD = "0ld0ld0ld".replace("l", "1")          # "01d01d01d": another build's hash
-WORKDIR = "/tmp/blaster_load.Zz9"
+WORKDIR = "/tmp/blaster_load.Zz9aB3"
 SSH = "blaster-vm"
 ADAPTER_LOCK = "jtag-blaster-blaster-vm"
 
@@ -115,19 +116,23 @@ def info(h=HASH, uid=UID, product="Ultimate 64 Elite"):
 class Remote:
     """The runner: scp records the copy's hash; ssh commands are answered as the far side's tools would.
 
-    Each reply is (rc, stdout, stderr), or a list of them consumed in order (the last repeats)."""
+    Each reply is (rc, stdout, stderr), or a list of them consumed in order (the last repeats). The two process
+    checks, unless a reply is given for them, run the command's own grep pattern over ``procs`` plus the shell that
+    carries the command, as `ps | grep -E` would; pkill removes what its pattern matches."""
 
     def __init__(self, ev, **replies):
-        self.ev, self.argv, self.uploaded = ev, [], None
-        self.replies = {"tools": (0, "", ""), "mktemp": (0, WORKDIR + "\n", ""), "sha": None,
-                        "srec": (0, "5" * 64 + f"  {WORKDIR}/app.elf.srec\n", ""), "stray": (1, "", ""),
+        self.ev, self.argv, self.uploaded, self.timeouts = ev, [], None, {}
+        self.noise = replies.pop("noise", "")       # text an env script would print before the answer
+        self.procs = list(replies.pop("procs", []))  # the far side's process table, as `ps -eo pid=,args=` lines
+        self.replies = {"tools": (0, "", ""), "busy": None, "mktemp": (0, WORKDIR + "\n", ""), "sha": None,
+                        "srec": (0, "5" * 64 + f"  {WORKDIR}/app.elf.srec\n", ""), "stray": None,
                         "kill": (0, "", ""), "jtagd": (0, "4711\n", ""), "jtagd_start": (0, "", ""),
                         "chain": (0, CHAIN, ""), "download": (0, "Downloaded 1234KB\nVerified OK\nStarting processor\n", ""),
                         "cleanup": (0, "", "")}
         self.replies.update(replies)
 
     def kind(self, command):
-        for needle, kind in (("nios2-download -g", "download"), ("command -v", "tools"), ("mktemp", "mktemp"),
+        for needle, kind in (("nios2-download -g", "download"), ("[n]ios2-download", "busy"), ("command -v", "tools"), ("mktemp", "mktemp"),
                              ("objcopy", "srec"), ("sha256sum", "sha"), ("pkill", "kill"), ("ps -eo", "stray"),
                              ("pgrep -x jtagd", "jtagd"), ("start-jtagd", "jtagd_start"), ("jtagconfig", "chain"),
                              ("rm -rf", "cleanup")):
@@ -144,13 +149,24 @@ class Remote:
         assert argv[0] == "ssh", argv
         kind = self.kind(argv[-1])
         self.ev.append((kind,))
+        self.timeouts[kind] = timeout
         reply = self.replies[kind]
+        if kind in ("busy", "stray", "kill") and (reply is None or kind == "kill"):
+            pattern = re.search(r"-[Ef] '([^']+)'", argv[-1]).group(1)
+            table = self.procs + [" 1 sh -c " + argv[-1].replace("\n", "; ")]
+            hits = [line for line in table if re.search(pattern, line)]
+            if kind == "kill":
+                self.procs = [line for line in self.procs if line not in hits]
+            else:
+                reply = (0, "\n".join(hits) + "\n", "") if hits else (1, "", "")
         if kind == "sha" and reply is None:
             reply = (0, f"{self.uploaded}  {WORKDIR}/app.elf\n", "")
         if isinstance(reply, list):
             reply = reply.pop(0) if len(reply) > 1 else reply[0]
         if isinstance(reply, BaseException):
             raise reply
+        if kind in ("mktemp", "sha", "srec"):
+            reply = (reply[0], self.noise + reply[1], reply[2])
         return reply
 
     def commands(self, kind):
@@ -189,6 +205,8 @@ def reload_(env_, client_script, remote=None, host="u64e", **kw):
     return bl.blaster_load(host, img, **args)
 
 
+# The bound env text runs first, in the same shell, with its own output discarded.
+ENV_PREFIX = "{ . /etc/profile.d/tools.sh\n} >/dev/null\n"
 FULL = [info(OLD, uid="DEF456"), info(HASH, uid="DEF456")]      # what the fully bound device ("u64e-full") answers
 
 
@@ -203,7 +221,7 @@ def test_a_load_runs_the_gates_in_order_and_proves_the_restart_by_the_hash_chang
     remote = Remote(ev)
     rec = reload_(env, [info(OLD), info(HASH)], remote)
     assert ev[:3] == [("acquire", "device"), ("acquire", "adapter"), ("info", OLD)]
-    assert kinds(ev)[3:] == ["tools", "mktemp", "scp", "sha", "stray", "jtagd", "chain", "download", "info",
+    assert kinds(ev)[3:] == ["tools", "busy", "mktemp", "scp", "sha", "stray", "jtagd", "chain", "download", "info",
                              "cleanup", "release", "release"]
     assert ev[-2:] == [("release", "adapter"), ("release", "device")]
     assert remote.commands("download") == [f"nios2-download -g {WORKDIR}/app.elf"]
@@ -230,7 +248,7 @@ def test_the_bound_ssh_route_reaches_every_command(env):
         port_flag = "-P" if argv[0] == "scp" else "-p"
         assert argv[argv.index(port_flag) + 1] == "2022"
         if argv[0] == "ssh":
-            assert argv[-2] == SSH and argv[-1].startswith(". /etc/profile.d/tools.sh\n")
+            assert argv[-2] == SSH and argv[-1].startswith(ENV_PREFIX)
 
 
 def test_the_device_lock_is_nestable_and_the_adapter_lock_is_keyed_by_the_route(env):
@@ -291,6 +309,34 @@ def test_an_elf_of_another_build_than_the_expected_hash_refuses_before_any_lock_
     assert e.value.stage == "hash" and "embed" in str(e.value) and ev == []
 
 
+def test_an_elf_that_embeds_only_six_digits_of_the_hash_is_another_build(env):
+    ev, img, _ = env
+    image = elf(hash_=HASH[:6] + "000")
+    img.write_bytes(image)
+    with pytest.raises(jl.JtagLoadError) as e:
+        reload_((ev, img, hashlib.sha256(image).hexdigest()), [info(OLD)])
+    assert e.value.stage == "hash" and ev == []
+
+
+PAYLOAD = 0x200 + len(HASH) + 16              # the size of elf()'s one segment
+
+
+def test_the_region_and_entry_checks_are_exact_at_their_boundaries():
+    bl.check_elf(elf(paddr=bl.APP_REGION_END - PAYLOAD), HASH)             # ends exactly at the limit
+    bl.check_elf(elf(entry=PAYLOAD - 1), HASH)                             # the segment's last byte
+    for image in (elf(paddr=bl.APP_REGION_END - PAYLOAD + 1), elf(entry=PAYLOAD)):
+        with pytest.raises(jl.JtagLoadError) as e:
+            bl.check_elf(image, HASH)
+        assert e.value.stage == "image"
+
+
+def test_a_malformed_srec_pin_refuses_before_any_lock_or_command(env):
+    ev = env[0]
+    with pytest.raises(jl.JtagLoadError) as e:
+        reload_(env, [info(OLD)], srec_sha256="5" * 63)
+    assert e.value.stage == "hash" and ev == []
+
+
 # ---- bindings -------------------------------------------------------------------------------------------------
 
 # "hostabc123" is not in devices.toml; cut like a lock key it would read as the bound table's id.
@@ -337,6 +383,7 @@ def test_a_dry_run_touches_nothing_and_returns_the_plan(env):
     assert ev == [] and rec["result"] == "dry-run ok"
     assert any("nios2-download -g" in step for step in rec["plan"])
     assert any("jtagconfig -n" in step for step in rec["plan"])
+    assert not any(str(env[1]) in step for step in rec["plan"])       # the upload is the pinned copy, not the source
 
 
 def test_a_dry_run_still_refuses_a_wrong_pin(env):
@@ -365,16 +412,15 @@ def test_a_busy_adapter_releases_the_device_and_runs_no_command(env):
 
 def test_a_lock_shell_holder_is_honoured_and_a_stale_claim_refused(env, monkeypatch):
     import c64_test_harness.backends.device_lock as dl
-    import _u64_host
     ev = env[0]
-    monkeypatch.setenv("C64U_LOCK_PID", "4242")
+    shell = os.getppid()                                # a real ancestor: nothing about the parent walk is faked
+    monkeypatch.setenv("C64U_LOCK_PID", str(shell))
     monkeypatch.setenv("C64U_LOCK_HOST", "u64e")
-    monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 4242})
-    monkeypatch.setattr(_u64_host, "_is_ancestor", lambda pid, max_depth=64: pid == 4242)
+    monkeypatch.setattr(dl, "device_lock_holder", lambda h, lock_dir=None: {"pid": shell})
     assert reload_(env, [info(OLD), info(HASH)])["result"] == "ok"
     assert ("acquire", "device") not in ev and ("acquire", "adapter") in ev and ("download",) in ev
     del ev[:]
-    monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 1})
+    monkeypatch.setattr(dl, "device_lock_holder", lambda h, lock_dir=None: {"pid": 1})
     with pytest.raises(jl.JtagLoadError) as e:
         reload_(env, [info(OLD), info(HASH)])
     assert e.value.stage == "lock" and ("download",) not in ev and "scp" not in kinds(ev)
@@ -392,11 +438,40 @@ def test_a_box_that_does_not_answer_is_refused_unless_the_caller_says_dark(env):
 
 def test_a_dark_box_is_loaded_and_identified_only_afterwards(env):
     ev = env[0]
-    rec = reload_(env, [None, None, info(HASH)], dark=True)
+    rec = reload_(env, [None, None, None, None, info(HASH)], dark=True)
     assert rec["pre_info"] is None and rec["dark"] is True
     assert rec["result"] == "ok" and rec["restart_proof"] == "no-answer-before"
     assert rec["info"]["unique_id"] == UID
+    assert kinds(ev)[:6] == ["acquire", "acquire", "info", "info", "info", "tools"]      # three misses, then work
     assert kinds(ev).index("download") < len(ev) - 1 - kinds(ev)[::-1].index("info")
+
+
+@pytest.mark.parametrize("misses", [1, 2])
+def test_a_box_that_drops_a_request_or_two_is_not_dark_and_proves_nothing_by_it(env, misses):
+    """--dark on a healthy box already on the expected hash: fewer than three misses in a row is not an outage."""
+    ev = env[0]
+    rec = reload_(env, [None] * misses + [info(HASH)], dark=True)
+    assert rec["pre_info"]["git_commit_hash"] == HASH
+    assert rec["result"] == "ok-unproven" and rec["restart_proof"] is None
+
+
+def test_a_box_that_answers_late_under_dark_is_still_identified_before_any_command(env):
+    ev = env[0]
+    with pytest.raises(jl.JtagLoadError) as e:
+        reload_(env, [None, info(OLD, uid="FFFFFF")], dark=True)
+    assert e.value.stage == "identity"
+    assert kinds(ev) == ["acquire", "acquire", "info", "info", "release", "release"]
+
+
+@pytest.mark.parametrize("pre", [{"unique_id": UID, "product": "Ultimate 64 Elite"}, info(""), info("unknown")],
+                         ids=["no-hash", "empty-hash", "not-a-hash"])
+def test_a_device_that_reported_no_hash_before_has_not_changed_its_hash(env, pre):
+    ev = env[0]
+    rec = reload_(env, [pre, info(HASH)])
+    assert rec["result"] == "ok-unproven" and rec["restart_proof"] is None and rec["rest_drop_seen"] is False
+    del ev[:]
+    rec = reload_(env, [pre, None, None, None, info(HASH)])
+    assert rec["result"] == "ok" and rec["restart_proof"] == "rest-drop"
 
 
 @pytest.mark.parametrize("after", [info(HASH, uid="FFFFFF"), info(HASH, product="C64 Ultimate")],
@@ -404,7 +479,7 @@ def test_a_dark_box_is_loaded_and_identified_only_afterwards(env):
 def test_another_device_answering_after_a_dark_load_is_an_identity_failure(env, after):
     ev = env[0]
     with pytest.raises(jl.JtagLoadError) as e:
-        reload_(env, [None, after], dark=True)
+        reload_(env, [None, None, None, after], dark=True)
     assert e.value.stage == "identity" and ("download",) in ev
     assert ev[-2:] == [("release", "adapter"), ("release", "device")]
 
@@ -449,9 +524,57 @@ def test_a_copy_that_arrives_with_another_hash_refuses_before_the_download(env):
     assert ("cleanup",) in env[0]
 
 
-def test_an_unusable_remote_workdir_refuses_before_the_upload(env):
-    refused_before_download(env, "remote", remote=Remote(env[0], mktemp=(0, "/tmp/x; rm -rf ~\n", "")))
+@pytest.mark.parametrize("answer", ["/tmp/x; rm -rf ~", "/", "/tmp/..", "/tmp/blaster_load.abc", "/home/blaster_load.Zz9aB3",
+                                    "/tmp/blaster_load.Zz9aB3/../.."])
+def test_only_a_directory_of_our_own_mktemp_template_is_used_and_later_removed(env, answer):
+    refused_before_download(env, "remote", remote=Remote(env[0], mktemp=(0, answer + "\n", "")))
     assert "scp" not in kinds(env[0]) and ("cleanup",) not in env[0]
+
+
+def test_text_printed_before_an_answer_does_not_become_the_answer(env):
+    ev = env[0]
+    remote = Remote(ev, noise="Quartus environment loaded\nlicense ok\n")
+    rec = reload_(env, [info(OLD), info(HASH)], remote, srec_sha256="5" * 64)
+    assert rec["result"] == "ok" and remote.commands("cleanup") == [f"rm -rf {WORKDIR}"]
+
+
+@pytest.mark.parametrize("running", [" 900 /bin/sh nios2-download -g /tmp/x/app.elf", " 901 jtagconfig -n"],
+                         ids=["download", "jtagconfig"])
+def test_a_jtag_tool_still_running_on_the_far_side_refuses_and_is_never_killed(env, running):
+    """A download whose ssh timed out here may still run there, after both locks were released."""
+    ev = env[0]
+    remote = Remote(ev, procs=[" 12 sshd: listener", running])
+    refused_before_download(env, "remote", remote=remote, kill_stray_gdb=True)
+    assert ("kill",) not in ev and "scp" not in kinds(ev) and ("mktemp",) not in ev
+    assert remote.procs == [" 12 sshd: listener", running]
+
+
+@pytest.mark.parametrize("stray", [" 812 nios2-gdb-server --tcpport 2342", " 813 nios2-elf-gdb app.elf"])
+def test_the_stray_debugger_check_finds_and_kills_exactly_the_debuggers(env, stray):
+    """The patterns are run for real over a process table that includes the shell carrying them."""
+    ev = env[0]
+    others = [" 12 sshd: listener", " 40 jtagd --user-start"]
+    refused_before_download(env, "remote", remote=Remote(ev, procs=others + [stray]))
+    del ev[:]
+    remote = Remote(ev, procs=others + [stray])
+    assert reload_(env, [info(OLD), info(HASH)], remote, kill_stray_gdb=True)["result"] == "ok"
+    assert remote.procs == others and ("kill",) in ev
+
+
+def test_the_download_gets_the_callers_timeout(env):
+    remote = Remote(env[0])
+    reload_(env, [info(OLD), info(HASH)], remote, download_timeout=777)
+    assert remote.timeouts["download"] == 777
+
+
+@pytest.mark.parametrize("reply", [(1, "", "rm: permission denied"), TimeoutError("slow")], ids=["rc", "timeout"])
+def test_a_failed_cleanup_is_recorded_and_does_not_fail_the_load(env, reply):
+    rec = reload_(env, [info(OLD), info(HASH)], Remote(env[0], cleanup=reply))
+    assert rec["result"] == "ok" and rec["cleanup_error"]
+
+
+def test_a_clean_run_records_no_cleanup_error(env):
+    assert "cleanup_error" not in reload_(env, [info(OLD), info(HASH)])
 
 
 def test_the_srec_pin_is_checked_on_the_remote_conversion_before_the_download(env):
@@ -461,6 +584,8 @@ def test_the_srec_pin_is_checked_on_the_remote_conversion_before_the_download(en
     del ev[:]
     rec = reload_(env, [info(OLD), info(HASH)], srec_sha256="5" * 64)
     assert rec["result"] == "ok" and kinds(ev).index("srec") < kinds(ev).index("download")
+    upper = Remote(ev, srec=(0, "ab" * 32 + f"  {WORKDIR}/app.elf.srec\n", ""))
+    assert reload_(env, [info(OLD), info(HASH)], upper, srec_sha256="AB" * 32)["result"] == "ok"
     del ev[:]
     reload_(env, [info(OLD), info(HASH)])
     assert ("srec",) not in ev                    # no pin, no conversion
@@ -495,7 +620,7 @@ def test_a_stopped_jtagd_refuses_unless_a_start_command_is_bound(env):
     remote = Remote(ev, jtagd=[(1, "", ""), (0, "99\n", "")])
     assert reload_(env, FULL, remote, host="u64e-full")["result"] == "ok"
     assert kinds(ev).index("jtagd_start") < kinds(ev).index("chain")
-    assert remote.commands("jtagd_start") == [". /etc/profile.d/tools.sh\nstart-jtagd --user"]
+    assert remote.commands("jtagd_start") == [ENV_PREFIX + "start-jtagd --user"]
     del ev[:]
     refused_before_download(env, "remote", remote=Remote(ev, jtagd=(1, "", "")), host="u64e-full", script=FULL)
     assert ("jtagd_start",) in ev
@@ -509,7 +634,11 @@ def test_a_stopped_jtagd_refuses_unless_a_start_command_is_bound(env):
     CHAIN + "  02B030DD   5CEBA4/5CEFA4\n",
     "1) USB-Blaster [1-1]\n  Unable to read device chain - JTAG chain broken\n",
     CHAIN.replace("Nios II #0", ""),
-], ids=["no-cable", "two-cables", "other-cable", "other-fpga", "two-devices", "broken-chain", "no-nios-node"])
+    CHAIN.replace("    Node 19104600", "  a second device in a layout nobody captured\n    Node 19104600"),
+    "jtagd restarted\n" + CHAIN,
+    "  02B030DD   5CEBA4/5CEFA4\n" + CHAIN,
+], ids=["no-cable", "two-cables", "other-cable", "other-fpga", "two-devices", "broken-chain", "no-nios-node",
+        "unknown-line-under-the-cable", "unknown-line-before-the-cable", "device-before-any-cable"])
 def test_a_chain_that_is_not_the_one_bound_cable_with_a_nios_refuses_before_the_download(env, chain):
     refused_before_download(env, "chain", remote=Remote(env[0], chain=(0, chain, "")))
 
@@ -552,7 +681,13 @@ def test_a_device_that_never_comes_back_is_a_failure(env):
 def test_a_same_hash_load_is_proven_only_by_a_rest_drop(env):
     ev = env[0]
     rec = reload_(env, [info(HASH), None, None, None, info(HASH)])
-    assert rec["result"] == "ok" and rec["restart_proof"] == "rest-drop"
+    assert rec["result"] == "ok" and rec["restart_proof"] == "rest-drop" and rec["rest_drop_seen"] is True
+
+
+def test_three_misses_with_an_answer_between_them_are_not_a_drop(env):
+    """Packet loss is not an outage: the three misses must be consecutive."""
+    rec = reload_(env, [info(HASH), None, None, info(HASH), None, info(HASH)])
+    assert rec["result"] == "ok-unproven" and rec["restart_proof"] is None and rec["rest_drop_seen"] is False
 
 
 def test_a_same_hash_load_without_a_rest_drop_is_reported_unproven(env):

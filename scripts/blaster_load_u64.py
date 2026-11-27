@@ -25,18 +25,21 @@ Gates, in order. Before any lock or command: the binding; ``ssh`` and ``scp`` pr
 SHA-256 equal to the caller's; the copy is a little-endian Nios II ELF32 whose segments sit in the application's
 region, with the entry inside one, and which embeds the expected git hash (its first 7 digits). Then, under the device's DeviceLock
 (``allow_nested``; a verified lock shell's hold is accepted) and the route's own lock: /v1/info must answer as the
-bound unique_id and a U64 product, or, with ``dark=True``, may not answer at all. Preflight on the far side, where
-everything that can fail must fail before the Nios is paused: the tools exist; the upload's SHA-256 there; the SREC
+bound unique_id and a U64 product, or, with ``dark=True``, may go unanswered three times in a row. Preflight on the
+far side, where everything that can fail must fail before the Nios is paused: the tools exist; no ``nios2-download``
+or ``jtagconfig`` is still running there (never killed); the upload's SHA-256 there; the SREC
 conversion's SHA-256 when one is pinned; no stray ``nios2-gdb-server``/``nios2-elf-gdb`` (killed only on request);
 ``jtagd`` running; ``jtagconfig -n`` shows exactly one cable, the bound one, with exactly one 5CE (Cyclone V E)
 device and a Nios II node. Then one ``nios2-download -g``, never retried. Afterwards /v1/info must answer with the
 bound unique_id, a U64 product and the expected git hash; any other device answering is an identity failure.
 
 What the result proves (#570): a hash that changed to the expected one proves the new image started
-(``restart_proof: hash-change``). A box that did not answer before and answers afterwards as the bound device with
-the expected hash was restarted (``no-answer-before``). When the hash was already the expected one, only a REST
-outage of three consecutive polls after the download is accepted (``rest-drop``); without one the result is
-``ok-unproven``, exit 3: the tool returned 0 and the device answers, which it also did before.
+(``restart_proof: hash-change``); a device that reported no hash before has not changed it. A box that left three
+requests in a row unanswered before and answers afterwards as the bound device with the expected hash was restarted
+(``no-answer-before``). Otherwise (the hash already the expected one, or none reported) only three consecutive
+unanswered requests after the download are accepted (``rest-drop``: an outage of roughly 3 to 18 s, which a network
+fault of that length would also produce); without them the result is ``ok-unproven``, exit 3: the tool returned 0
+and the device answers, which it also did before.
 
     blaster_load_u64.py load HOST ELF --sha256 H --expect-hash G [--srec-sha256 S] [--dark] [--kill-stray-gdb]
                              [--preflight-only] [--dry-run] [--record FILE]
@@ -70,8 +73,13 @@ EM_ALTERA_NIOS2 = 113
 APP_REGION_END = 1 << 24
 # The bracket keeps the pattern from matching the shell that carries it.
 STRAY_GDB = "[n]ios2-(gdb-server|elf-gdb)"
+# The JTAG tools themselves: a download whose ssh timed out here can still run there, after the locks were released.
+BUSY_JTAG = "[n]ios2-download|[j]tagconfig"
+WORKDIR_RE = r"/tmp/blaster_load\.[A-Za-z0-9]{6}"      # what `mktemp -d /tmp/blaster_load.XXXXXX` answers, nothing else
+MISSES_FOR_OUTAGE = 3                                  # consecutive unanswered /v1/info requests that count as "down"
 REQUIRED_KEYS = ("jtag_blaster_ssh", "jtag_blaster_cable")
-STOP = ("STOP: the Nios may be paused or the application not started. Nothing is retried; a power cycle brings "
+STOP = ("STOP: the Nios may be paused or the application not started, and after a timeout nios2-download may still "
+        "be running on the far side (the next run refuses while it is). Nothing is retried; a power cycle brings "
         "the flashed application back")
 
 
@@ -143,22 +151,28 @@ def check_elf(data: bytes, expect_git_hash: str) -> None:
 
 
 def parse_jtagconfig(text: str) -> list[dict]:
-    """`jtagconfig -n` output as [{"name", "devices": [(idcode, part)], "nodes": [text]}], one per cable."""
+    """`jtagconfig -n` output as [{"name", "devices": [(idcode, part)], "nodes": [text]}], one per cable.
+
+    Strict: the layout here was written from the tool's documented output, not captured on a bench, so any non-blank
+    line that is not a cable, a device or a node is a refusal (JtagLoadError "chain") rather than skipped. A line
+    this does not know could be a second device."""
     cables: list[dict] = []
     for line in text.splitlines():
+        if not line.strip():
+            continue
         m = re.match(r"^(\d+)\)\s+(\S.*?)\s*$", line)
         if m:
             cables.append({"name": m.group(2), "devices": [], "nodes": []})
             continue
-        if not cables:
-            continue
-        m = re.match(r"^\s+Node\s+[0-9A-Fa-f]{8}\s*(.*?)\s*$", line)
-        if m:
-            cables[-1]["nodes"].append(m.group(1))
-            continue
-        m = re.match(r"^\s+([0-9A-Fa-f]{8})\s+(\S.*?)\s*$", line)
-        if m:
-            cables[-1]["devices"].append((m.group(1).lower(), m.group(2)))
+        node = re.match(r"^\s+Node\s+[0-9A-Fa-f]{8}\s*(.*?)\s*$", line)
+        device = re.match(r"^\s+([0-9A-Fa-f]{8})\s+(\S.*?)\s*$", line)
+        if not cables or not (node or device):
+            raise jl.JtagLoadError("chain", f"jtagconfig printed a line this script does not know ({line.strip()!r}); "
+                                   "board NOT touched")
+        if node:
+            cables[-1]["nodes"].append(node.group(1))
+        else:
+            cables[-1]["devices"].append((device.group(1).lower(), device.group(2)))
     return cables
 
 
@@ -188,6 +202,7 @@ def remote_commands(workdir: str) -> dict:
     return {
         "tools": ("for t in nios2-download jtagconfig sha256sum pgrep; do command -v $t >/dev/null || "
                   "{ echo missing: $t; exit 127; }; done"),
+        "busy": f"ps -eo pid=,args= | grep -E '{BUSY_JTAG}'",
         "mktemp": "mktemp -d /tmp/blaster_load.XXXXXX",
         "sha": f"sha256sum {elf}",
         "srec": f"nios2-elf-objcopy {elf} -O srec {elf}.srec && sha256sum {elf}.srec",
@@ -215,8 +230,9 @@ class _Remote:
         return opts
 
     def ssh_argv(self, command: str) -> list:
-        env = self.b["env"]
-        return ["ssh", *self._options("-p"), self.b["ssh"], f"{env}\n{command}" if env else command]
+        env = self.b["env"]             # in the same shell, its own output discarded: answers are parsed
+        return ["ssh", *self._options("-p"), self.b["ssh"],
+                f"{{ {env}\n}} >/dev/null\n{command}" if env else command]
 
     def scp_argv(self, src, dst: str) -> list:
         return ["scp", *self._options("-P"), str(src), f"{self.b['ssh']}:{dst}"]
@@ -245,8 +261,15 @@ class _Remote:
                                    "touched")
 
 
-def _first_word(out: str) -> str:
-    words = out.split()
+def _last_line(out: str) -> str:
+    """The answer is the last line a command printed; anything before it is somebody's banner."""
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def _hash_answer(out: str) -> str:
+    """The hash on a `sha256sum` answer line."""
+    words = _last_line(out).split()
     return words[0].lower() if words else ""
 
 
@@ -257,19 +280,25 @@ def preflight(remote: _Remote, binding: dict, local_elf: Path, sha256: str, srec
     if rc != 0:
         raise jl.JtagLoadError("setup", f"{binding['ssh']} lacks a tool this load needs ({out.strip()!r}); bind "
                                "jtag_blaster_env if they are only missing from PATH; board NOT touched")
+    rc, out = remote.step("running JTAG tools", remote_commands("")["busy"], ok=(0, 1))
+    if rc == 0:
+        raise jl.JtagLoadError("remote", f"a JTAG tool is already running on {binding['ssh']} "
+                               f"({out.strip()[-200:]!r}): an earlier download may not have ended. It is not "
+                               "killed here; board NOT touched")
     _rc, out = remote.step("workdir", remote_commands("")["mktemp"])
-    workdir = out.strip()
-    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", workdir):
-        raise jl.JtagLoadError("remote", f"mktemp answered {workdir!r}, not a directory path; board NOT touched")
+    workdir = _last_line(out)
+    if not re.fullmatch(WORKDIR_RE, workdir):       # it is later the argument of rm -rf
+        raise jl.JtagLoadError("remote", f"mktemp answered {workdir!r}, not a directory of this script's template; "
+                               "board NOT touched")
     state["workdir"] = workdir
     cmd = remote_commands(workdir)
     remote.put(local_elf, f"{workdir}/app.elf")
-    got = _first_word(remote.step("hash of the upload", cmd["sha"])[1])
+    got = _hash_answer(remote.step("hash of the upload", cmd["sha"])[1])
     if got != sha256:
         raise jl.JtagLoadError("hash", f"the upload's SHA-256 on {binding['ssh']} is {got!r}, not the pinned "
                                f"{sha256}; board NOT touched")
     if srec_sha256:
-        got = _first_word(remote.step("SREC conversion", cmd["srec"], timeout=120)[1])
+        got = _hash_answer(remote.step("SREC conversion", cmd["srec"], timeout=120)[1])
         if got != srec_sha256.lower():
             raise jl.JtagLoadError("hash", f"the SREC conversion on {binding['ssh']} hashes to {got!r}, not the "
                                    f"pinned {srec_sha256.lower()}; board NOT touched")
@@ -297,15 +326,18 @@ def preflight(remote: _Remote, binding: dict, local_elf: Path, sha256: str, srec
 
 
 def watch_for_drop(host: str, uid: str, window: float, client_factory, sleep, clock) -> bool:
-    """True once REST missed three consecutive polls (and, if time allows, answered again) within *window* seconds.
+    """True once /v1/info went unanswered MISSES_FOR_OUTAGE times in a row (then, if time allows, answered again)
+    within *window* seconds. An answer in between starts the count again: scattered misses are packet loss.
 
-    Every answer is identity-checked. This is the only restart signal a same-hash load has (#570)."""
+    Every answer is identity-checked. A request waits up to the client's timeout (5 s) and they are 1 s apart, so
+    the outage this sees lasted roughly 3 to 18 s. It is evidence of a restart, the only one a load has when the
+    hash cannot change (#570); a network outage of that length looks the same."""
     end, misses, dropped = clock() + window, 0, False
     while clock() < end:
         info = jl.try_info(host, client_factory)
         if info is None:
             misses += 1
-            dropped = dropped or misses >= 3
+            dropped = dropped or misses >= MISSES_FOR_OUTAGE
         else:
             jl.check_identity(info, uid, PRODUCTS)
             misses = 0
@@ -313,6 +345,33 @@ def watch_for_drop(host: str, uid: str, window: float, client_factory, sleep, cl
                 break
         sleep(1.0)
     return dropped
+
+
+def info_before(host: str, uid: str, dark: bool, client_factory, sleep) -> dict | None:
+    """The device's /v1/info before the load, identity-checked; None only for a box established as dark.
+
+    Without *dark* one unanswered request is a refusal. With it, the box counts as dark only after
+    MISSES_FOR_OUTAGE unanswered requests in a row, the criterion of watch_for_drop: a healthy box that dropped one
+    request must not come out of this as "did not answer before, answers now, so it restarted". Any answer on the
+    way is checked like every other."""
+    for attempt in range(MISSES_FOR_OUTAGE):
+        pre = jl.try_info(host, client_factory)
+        if pre is not None:
+            jl.check_identity(pre, uid, PRODUCTS)
+            return pre
+        if not dark:
+            raise jl.JtagLoadError("network", f"{host} does not answer /v1/info, so it cannot be identified before "
+                                   "the load; if the box is dark and this is its recovery, pass --dark")
+        if attempt + 1 < MISSES_FOR_OUTAGE:
+            sleep(1.0)
+    return None
+
+
+def hash_changes(pre: dict | None, expect: str) -> bool:
+    """True when *pre* reports a git hash and it is another one than *expect*: only then can the hash after the load
+    prove a restart. A device that reported none (or something that is no hash) has not changed its hash."""
+    reported = str((pre or {}).get("git_commit_hash") or "").lower()
+    return re.fullmatch(r"[0-9a-f]{7,40}", reported) is not None and not jl.hash_matches(reported, expect)
 
 
 def blaster_load(host: str, elf, *, sha256: str, expect_git_hash: str, srec_sha256: str | None = None,
@@ -323,8 +382,9 @@ def blaster_load(host: str, elf, *, sha256: str, expect_git_hash: str, srec_sha2
                  log=jl._log) -> dict:
     """Reload the bound U64's application from *elf* over the bound USB-Blaster route; return a record.
 
-    dark=True: the box need not answer /v1/info before the load (if it does, its identity is still checked); its
-    identity is then confirmed only by what answers afterwards. See the module docstring for the gates and for what
+    dark=True: the box need not answer /v1/info before the load. It counts as dark after three unanswered requests
+    in a row; if it answers, its identity is checked and the load goes on as for any answering box. The identity of
+    a dark box is confirmed only by what answers afterwards. See the module docstring for the gates and for what
     ``restart_proof`` means."""
     sleep, clock = sleep or time.sleep, clock or time.monotonic
     uid, binding = bound_u64(host)
@@ -351,13 +411,13 @@ def blaster_load(host: str, elf, *, sha256: str, expect_git_hash: str, srec_sha2
                                        "is reached over ssh")
             if dry_run:
                 cmd = remote_commands("<workdir>")
-                steps = ["tools", "mktemp", "sha"] + (["srec"] if srec_sha256 else []) + ["stray", "jtagd", "chain"]
+                steps = ["tools", "busy", "mktemp", "sha"] + (["srec"] if srec_sha256 else []) + ["stray", "jtagd", "chain"]
                 steps += [] if preflight_only else ["download"]
                 rec["plan"] = ([f"DeviceLock({host}, allow_nested) then DeviceLock({binding['lock']})",
                                 f"GET /v1/info: unique_id {uid}, product in {list(PRODUCTS)}"
                                 + (" (may not answer: dark)" if dark else "")]
                                + [" ".join(remote.ssh_argv(cmd[s])) if s != "sha" else
-                                  " ".join(remote.scp_argv(elf, "<workdir>/app.elf")) + " ; "
+                                  " ".join(remote.scp_argv("<pinned copy of the ELF>", "<workdir>/app.elf")) + " ; "
                                   + " ".join(remote.ssh_argv(cmd[s])) for s in steps]
                                + ([] if preflight_only else
                                   [f"GET /v1/info until unique_id {uid} reports git hash {expect}"])
@@ -365,14 +425,8 @@ def blaster_load(host: str, elf, *, sha256: str, expect_git_hash: str, srec_sha2
                 rec["result"] = "dry-run ok"
                 return rec
             with jl._Locked(host, {"lock": binding["lock"]}, lock_timeout, lock_factory):
-                pre = jl.try_info(host, client_factory)
+                pre = info_before(host, uid, dark, client_factory, sleep)
                 rec["pre_info"] = pre
-                if pre is not None:
-                    jl.check_identity(pre, uid, PRODUCTS)
-                elif not dark:
-                    raise jl.JtagLoadError("network", f"{host} does not answer /v1/info, so it cannot be identified "
-                                           "before the load; if the box is dark and this is its recovery, pass "
-                                           "--dark")
                 try:
                     cable = preflight(remote, binding, copy, want, srec_sha256, kill_stray_gdb, state, sleep, log)
                     rec["cable"], rec["chain"] = cable["name"], cable["devices"]
@@ -389,8 +443,10 @@ def blaster_load(host: str, elf, *, sha256: str, expect_git_hash: str, srec_sha2
                     if rc != 0:
                         raise jl.JtagLoadError("download", f"nios2-download exit {rc}: {(err or out).strip()[-300:]!r}. "
                                                f"{STOP}")
-                    same = pre is not None and jl.hash_matches(pre.get("git_commit_hash"), expect)
-                    dropped = watch_for_drop(host, uid, drop_window, client_factory, sleep, clock) if same else None
+                    changes = hash_changes(pre, expect)
+                    # An answering box whose hash cannot be seen to change needs the outage as its evidence.
+                    watch = pre is not None and not changes
+                    dropped = watch_for_drop(host, uid, drop_window, client_factory, sleep, clock) if watch else None
                     rec["rest_drop_seen"] = dropped
                     try:
                         rec["info"] = jl.wait_info(host, uid, expect, net_timeout, client_factory, sleep, clock,
@@ -400,14 +456,15 @@ def blaster_load(host: str, elf, *, sha256: str, expect_git_hash: str, srec_sha2
                             raise
                         raise jl.JtagLoadError("network", f"{str(e).split('] ', 1)[-1]}. {STOP}") from None
                     rec["up_s"] = round(clock() - t0, 1)
-                    rec["restart_proof"] = ("no-answer-before" if pre is None else "hash-change" if not same
+                    rec["restart_proof"] = ("no-answer-before" if pre is None else "hash-change" if changes
                                             else "rest-drop" if dropped else None)
                     rec["result"] = "ok"
                     if rec["restart_proof"] is None:
                         rec["result"] = "ok-unproven"
-                        rec["unproven"] = (f"the device reported {expect} before the load and reports it now, and "
-                                           "REST never missed three polls: nios2-download returned 0, but a restart "
-                                           "is not proven (#570)")
+                        rec["unproven"] = (f"the device reported {pre.get('git_commit_hash')!r} before the load, "
+                                           f"which cannot be seen to change to {expect}, and /v1/info never went "
+                                           f"unanswered {MISSES_FOR_OUTAGE} times in a row: nios2-download returned "
+                                           "0, but a restart is not proven (#570)")
                     log(f"up: {rec['info'].get('git_commit_hash')} {rec['info'].get('product')}, restart proof: "
                         f"{rec['restart_proof']}")
                     return rec

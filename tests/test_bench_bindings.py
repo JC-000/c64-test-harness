@@ -75,6 +75,10 @@ def test_a_missing_file_is_refused_and_named(bench):
     "[devices.abc123]\noutlet_kind = 2\n",
     '[devices.abc123]\njtag_blaster_ssh = "-lroot"\n',      # would be read by ssh as an option
     '[devices.abc123]\njtag_blaster_ssh = "vm; reboot"\n',
+    '[devices.abc123]\njtag_blaster_ssh = "vm host"\n',
+    '[devices.abc123]\njtag_blaster_ssh = "vm$(x)"\n',
+    '[devices.abc123]\njtag_blaster_ssh = "vm`x`"\n',
+    '[devices.abc123]\njtag_blaster_ssh = "vm|x"\n',
     '[devices.abc123]\njtag_blaster_ssh = ""\n',
     "[devices.abc123]\njtag_blaster_ssh = 22\n",
     '[devices.abc123]\njtag_blaster_ssh_port = "2200"\n',
@@ -85,7 +89,8 @@ def test_a_missing_file_is_refused_and_named(bench):
     "[devices.abc123]\njtag_blaster_env = 1\n",
     '[devices.abc123]\njtag_blaster_jtagd_start = ""\n',
 ], ids=["ram-run-str", "ram-run-int", "scan-only-int", "baud-str", "baud-bool", "baud-zero", "location-int",
-        "location-blank", "outlet-empty", "kind-int", "blaster-ssh-option", "blaster-ssh-shell", "blaster-ssh-empty",
+        "location-blank", "outlet-empty", "kind-int", "blaster-ssh-option", "blaster-ssh-shell", "blaster-ssh-space",
+        "blaster-ssh-subshell", "blaster-ssh-backtick", "blaster-ssh-pipe", "blaster-ssh-empty",
         "blaster-ssh-int", "blaster-port-str", "blaster-port-range", "blaster-port-bool", "blaster-identity-option",
         "blaster-cable-blank", "blaster-env-int", "blaster-jtagd-empty"])
 def test_a_value_of_the_wrong_type_is_refused(bench, text):

@@ -580,7 +580,7 @@ hold by a verified ancestor lock shell). All four are gated by
     (text that the one cable's name in `jtagconfig` must contain). Optional:
     `jtag_blaster_ssh_port`, `jtag_blaster_ssh_identity`,
     `jtag_blaster_env` (shell text run before every command there, for
-    `PATH`) and `jtag_blaster_jtagd_start` (the command that starts `jtagd`
+    `PATH`; its own output is discarded) and `jtag_blaster_jtagd_start` (the command that starts `jtagd`
     when it is not running; without it a stopped `jtagd` is a refusal).
     ssh runs with `BatchMode=yes`, so it never prompts.
   - **These keys are a capability of their own.** `jtag_scan_only = true`
@@ -595,27 +595,37 @@ hold by a verified ancestor lock shell). All four are gated by
     `--expect-hash`.
   - **Under the device's `DeviceLock` and the route's own lock:** `/v1/info`
     must answer as the bound `unique_id` and a U64 product. With `--dark`
-    it may not answer at all; a device that does answer is still checked.
+    the box counts as dark after three unanswered requests in a row; if it
+    answers on the way, it is identity-checked and the load goes on as for
+    any answering box.
   - **Preflight, before the Nios is paused:** the tools exist on the far
-    side; the upload hashes to the pin there; with `--srec-sha256`, so does
+    side; no `nios2-download` or `jtagconfig` is still running there (a
+    refusal, never a kill: a download whose ssh timed out here can outlive
+    the locks); the work directory is one from this script's own `mktemp`
+    template; the upload hashes to the pin there; with `--srec-sha256`, so does
     the far side's `nios2-elf-objcopy` SREC conversion; no stray
     `nios2-gdb-server` or `nios2-elf-gdb` (a refusal, or killed with
     `--kill-stray-gdb`); `jtagd` runs; `jtagconfig -n` shows exactly one
     cable, the bound one, with exactly one `5CE` device and a `Nios II`
-    node. `--preflight-only` stops here.
+    node, and no line the parser does not know (the layout is not captured
+    from a bench yet, so an unknown line is a refusal).
+    `--preflight-only` stops here.
   - **One download, never retried.** A non-zero exit or a timeout is a
     failure that says to stop: the Nios may be left paused.
   - **Afterwards** `/v1/info` must answer with the bound `unique_id`, a U64
     product and the expected git hash. Another device answering is an
     identity failure.
   - **What the result proves** (`restart_proof`; #570 is the limit):
-    `hash-change` when the hash changed to the expected one;
-    `no-answer-before` when the box did not answer before the load and
-    answers as the bound device afterwards (one unanswered request, not a
-    measured outage); `rest-drop` when the hash was already the expected
-    one and REST then missed three polls in a row. A same-hash load without
-    that drop ends `ok-unproven` with exit 3: the tool returned 0 and the
-    device answers, as it did before.
+    `hash-change` when the device reported another hash before and the
+    expected one afterwards (a device that reported none has not changed
+    it); `no-answer-before` when three requests in a row went unanswered
+    before the load and the bound device answers afterwards; `rest-drop`
+    when the hash could not be seen to change and three requests in a row
+    then went unanswered. Each request waits up to 5 s and they are 1 s
+    apart, so that is an outage of roughly 3 to 18 s; a network fault of
+    that length looks the same. Without it the load ends `ok-unproven`
+    with exit 3: the tool returned 0 and the device answers, as it did
+    before.
   - `--dry-run` runs the local checks, prints the plan and sends nothing.
     Exit 0 is loaded and proven, 3 loaded but unproven, 2 refused or failed.
   - **Not run on a device yet.** The command sequence was read from a
