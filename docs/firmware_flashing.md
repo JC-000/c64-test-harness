@@ -866,8 +866,22 @@ bench builds of 3.15a, bindings from a private file through
   JTAG; its `/Temp` hygiene was disarmed for the run
   (`U64_AUTO_TEMP_GC=0`), since no body-carrying request was sent.
 
-Not run on a device: the `u64_jtag_reload` backend through this call (it
-is chosen only for a U64 that does not answer; `blaster_load_u64.py`
-itself ran live, see above), `baseline_first`, a failed load with the
-restore that follows it, an interrupt, and a lock-shell parent. Those
-rest on the stand-in tests.
+- Ultimate 64 Elite, `u64_jtag_reload` (2026-11-27, n=1 per direction),
+  on a device that answered throughout. The backend was reached by
+  failing the wrapper's first three status reads inside the driver's
+  process only; nothing made the device dark. A load of another build
+  took 41.3 s (4.0 s of injected misses, 37.3 s in the reload, the device
+  up 21.2 s after the download) and the way back to the baseline 36.7 s
+  (up after 21.5 s). Each was `ok` and `loaded`, with `hash-change`
+  carried through from the reload's own record, `dark=True` passed, the
+  reload's own read before the load answered by the device, and no
+  cleanup error; `jtagd` was not running and was started by the bound
+  start command. `dark_before` true in those two results is the injected
+  belief, not a fact about the device.
+
+Not run on a device: a real `no-answer-before` proof; a U64 that is in
+fact dark, and its recovery; the same-hash (`ok-unproven`) case through
+this call; the three-poll dark detection against a device that is
+silent; `baseline_first`; a failed load with the restore that follows
+it; an interrupt; and a lock-shell parent. Those rest on the stand-in
+tests.
