@@ -28,6 +28,14 @@ Everything else is refused: update images of either product, .cfw files, garbage
 updater prompt string or the SILENT marker (ultimate64_firmware_flash.PROMPT_STRINGS / SILENT_MARKER), whatever
 its shape: an updater that is started writes flash. The image's family must equal the device's.
 
+The image must also BE the build the caller names. Both formats carry the application's System Info line,
+"Git hash:   <hash>" (system_info.cc: "Git hash:   " APP_VERSION_HASH "\\n"), where the hash is the build's
+`git rev-parse --short HEAD` (target/common/rules.mk), the same macro /v1/info reports as git_commit_hash. That line
+is read from the file (embedded_git_hashes). An image with no such line, or with two different ones, is refused; so
+is a caller's hash that does not begin with every digit the image carries (a caller's hash shorter than the image's
+is refused too: fewer digits would leave part of it uncompared). After the load, /v1/info must report exactly the
+image's own hash.
+
 Adapter safety (C64U class): the adapter is the one bound to the device in bench.toml (jtag_load.adapter_binding;
 a jtag_scan_only device is refused), a JTAG_USB_LOCATION that names another location is refused here (jtag_load
 alone lets it override the table), and jtag_load's live IDCODE gate still runs before the FPGA is touched.
@@ -71,6 +79,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -114,7 +123,8 @@ class VolatileLoadError(jl.JtagLoadError):
 @dataclasses.dataclass(frozen=True)
 class VolatileImage:
     """A volatile image and its pins. *path*: the RAM-run .u64 (U64 line) or the one-record ultimate.app (C64U
-    class). *git_hash*: what /v1/info must report once it runs. *bit*/*bit_sha256*: the C64U FPGA bitstream.
+    class). *git_hash*: the build it is; it must begin with every digit of the hash the file carries, which is what
+    /v1/info must report once it runs. *bit*/*bit_sha256*: the C64U FPGA bitstream.
     *jtag_image*/*jtag_sha256*: U64 line only, what the U64 JTAG reload loads when the box is dark."""
     path: Path
     sha256: str
@@ -133,7 +143,8 @@ class VolatileResult:
     backend: str | None = None          # BACKEND_*; None when nothing was chosen
     family: str | None = None
     product: str | None = None          # as /v1/info reported it after the load (before it, when nothing loaded)
-    expect_git_hash: str | None = None
+    expect_git_hash: str | None = None  # the caller's
+    image_git_hash: str | None = None   # read from the image file; the caller's hash begins with all of it
     git_hash: str | None = None         # reported by the running firmware
     loaded: bool = False                # a load was performed and verified
     dark_before: bool | None = None     # the box did not answer before the load
@@ -187,11 +198,35 @@ def _updater_marks(data: bytes) -> list[str]:
     return [m.decode() for m in (*PROMPT_STRINGS, SILENT_MARKER) if m in data]
 
 
+_GIT_HASH_LINE = re.compile(rb"Git hash:   ([0-9a-fA-F]{7,40})\n")
+
+
+def embedded_git_hashes(data: bytes) -> list[str]:
+    """The distinct build hashes *data* carries, lower case: the application's System Info line, "Git hash:   "
+    APP_VERSION_HASH "\\n" (system_info.cc), whose hash is the string /v1/info reports as git_commit_hash."""
+    return sorted({m.group(1).decode().lower() for m in _GIT_HASH_LINE.finditer(data)})
+
+
+def image_git_hash(data: bytes, path, expect: str) -> str:
+    """The one hash *data* carries, refused (JtagLoadError) unless *expect* names that build: "image" when the file
+    carries no hash or two different ones, "hash" when *expect* does not begin with every digit the image carries."""
+    found = embedded_git_hashes(data)
+    if len(found) != 1:
+        raise jl.JtagLoadError("image", f"{path} carries {'no' if not found else 'several'} 'Git hash:' line"
+                               f"{'' if not found else 's ' + str(found)}: which build it is cannot be read from the "
+                               "file, so it is not loaded")
+    if not expect.startswith(found[0]):
+        raise jl.JtagLoadError("hash", f"{path} is build {found[0]}, not the expected {expect} (the expected hash "
+                               f"must begin with all {len(found[0])} digits the image carries)")
+    return found[0]
+
+
 @dataclasses.dataclass
 class _Prepared:
     image: VolatileImage
     family: str
-    expect: str
+    expect: str                     # the caller's, normalised
+    embedded: str                   # the image's own; expect begins with it
     copy: Path                      # the pinned copy the backend is given
     app_bin: Path | None = None     # C64U class: the extracted DRAM image ...
     app_sha256: str | None = None   # ... and its SHA-256
@@ -226,7 +261,7 @@ def prepare_image(image: VolatileImage, workdir: Path, tag: str = "image") -> _P
                                    "load only")
         copy = workdir / f"{tag}.u64"
         copy.write_bytes(data)
-        return _Prepared(image, FAMILY_U64, expect, copy)
+        return _Prepared(image, FAMILY_U64, expect, image_git_hash(data, image.path, expect), copy)
     copy = workdir / f"{tag}.app"
     copy.write_bytes(data)
     app_bin = workdir / f"{tag}.bin"
@@ -241,7 +276,7 @@ def prepare_image(image: VolatileImage, workdir: Path, tag: str = "image") -> _P
     if image.bit is None or not image.bit_sha256:
         raise jl.JtagLoadError("image", f"{image.path} is a C64 Ultimate RAM application; its load needs the FPGA "
                                ".bit and the .bit's SHA-256")
-    return _Prepared(image, FAMILY_C64U, expect, copy, app_bin, app_sha)
+    return _Prepared(image, FAMILY_C64U, expect, image_git_hash(data, image.path, expect), copy, app_bin, app_sha)
 
 
 def check_binding(host: str, uid: str, family: str) -> None:
@@ -331,7 +366,7 @@ def _backend_for(family: str, dark: bool, prep: _Prepared, o: _Opts) -> str:
 
 def _run_backend(backend: str, host: str, prep: _Prepared, o: _Opts, dry_run: bool = False) -> dict:
     if backend == BACKEND_RAM_RUN:
-        kw = dict(sha256=prep.image.sha256, expect_git_hash=prep.expect, volume=o.volume,
+        kw = dict(sha256=prep.image.sha256, expect_git_hash=prep.embedded, volume=o.volume,
                   lock_timeout=o.lock_timeout, dry_run=dry_run, lock_factory=o.lock_factory,
                   client_factory=o.client_factory, storage=o.storage, sleep=o.sleep, clock=o.clock, log=o.log)
         if o.menu_factory is not None:
@@ -341,27 +376,32 @@ def _run_backend(backend: str, host: str, prep: _Prepared, o: _Opts, dry_run: bo
         # cold=True always: a warm load on the C64 Ultimate runs the flashed app first and leaves stale I-cache
         # lines (false "does not boot"). No caller option reaches this argument.
         return o.jtag_load(host, prep.image.bit, prep.app_bin, bit_sha256=prep.image.bit_sha256,
-                           app_sha256=prep.app_sha256, expect_git_hash=prep.expect, lock_timeout=o.lock_timeout,
+                           app_sha256=prep.app_sha256, expect_git_hash=prep.embedded, lock_timeout=o.lock_timeout,
                            net_timeout=o.net_timeout, dry_run=dry_run, esp=o.esp, lock_factory=o.lock_factory,
                            client_factory=o.client_factory, log=o.log, cold=True)
     return o.u64_jtag_reload(host, prep.image.jtag_image, sha256=prep.image.jtag_sha256,
-                             expect_git_hash=prep.expect, timeout=o.jtag_timeout, lock_timeout=o.lock_timeout,
+                             expect_git_hash=prep.embedded, timeout=o.jtag_timeout, lock_timeout=o.lock_timeout,
                              lock_factory=o.lock_factory, client_factory=o.client_factory, dry_run=dry_run,
                              sleep=o.sleep, clock=o.clock, log=o.log)
 
 
+def _reports(info: dict | None, embedded: str) -> bool:
+    """Whether /v1/info reports exactly the image's own hash (the firmware reports the string its image carries)."""
+    return info is not None and str(info.get("git_commit_hash") or "").strip().lower() == embedded
+
+
 def _verify(res: VolatileResult, rec: dict, uid: str, family: str, expect: str, pre: dict | None) -> None:
-    """The running firmware must be the bound device, of the image's family, reporting the expected hash; then say
-    what is proven about the restart."""
+    """The running firmware must be the bound device, of the image's family, reporting the image's own hash
+    (*expect*); then say what is proven about the restart."""
     info = rec.get("info") if isinstance(rec, dict) else None
     if not isinstance(info, dict):
         raise jl.JtagLoadError("verify", "the backend returned no /v1/info after the load")
     res.product, res.git_hash = info.get("product"), info.get("git_commit_hash")
     _check_device(info, uid, family, "after the load")
-    if not jl.hash_matches(res.git_hash, expect):
+    if not _reports(info, expect):
         raise jl.JtagLoadError("verify", f"the running firmware reports git hash {res.git_hash!r}, the image's is "
                                f"{expect}")
-    res.hash_changed = None if pre is None else not jl.hash_matches(pre.get("git_commit_hash"), expect)
+    res.hash_changed = None if pre is None else not _reports(pre, expect)
     if res.backend == BACKEND_JTAG_COLD:
         if rec.get("cold") is not True or rec.get("user_id") != f"{jl.EXPECT_USERID:08x}":
             raise jl.JtagLoadError("verify", f"the JTAG load does not record a cold load with the user ID read back "
@@ -390,7 +430,7 @@ def _load(host: str, image: VolatileImage, action: str, o: _Opts, *, skip_if_run
         uid = _uid(host)
         with tempfile.TemporaryDirectory(prefix="volatile_load-") as td:
             prep = prepare_image(image, Path(td))
-            res.family, res.expect_git_hash = prep.family, prep.expect
+            res.family, res.expect_git_hash, res.image_git_hash = prep.family, prep.expect, prep.embedded
             check_binding(host, uid, prep.family)
             step("preflight")
             if dry_run:
@@ -402,6 +442,7 @@ def _load(host: str, image: VolatileImage, action: str, o: _Opts, *, skip_if_run
                 rec = _run_backend(answering, host, prep, o, dry_run=True)
                 return {"action": action, "host": host, "uid": uid, "family": prep.family,
                         "image": str(image.path), "sha256": str(image.sha256).lower(), "expect_git_hash": prep.expect,
+                        "image_git_hash": prep.embedded,
                         "backend_if_answering": answering, "backend_if_dark": dark, "jtag_timeout": o.jtag_timeout,
                         "backend_dry_run": rec, "result": "dry-run ok"}
             with jl._Locked(host, {}, o.lock_timeout, o.lock_factory):
@@ -413,16 +454,15 @@ def _load(host: str, image: VolatileImage, action: str, o: _Opts, *, skip_if_run
                     _check_device(pre, uid, prep.family, "before the load")
                 res.backend = _backend_for(prep.family, pre is None, prep, o)
                 step("identify")
-                if (skip_if_running and res.backend == BACKEND_RAM_RUN
-                        and jl.hash_matches(pre.get("git_commit_hash"), prep.expect)):
+                if skip_if_running and res.backend == BACKEND_RAM_RUN and _reports(pre, prep.embedded):
                     res.ok, res.hash_changed = True, False
-                    res.notes.append(f"already reporting {prep.expect}: nothing was loaded. A same-hash RAM-run cannot "
+                    res.notes.append(f"already reporting {prep.embedded}: nothing was loaded. A same-hash RAM-run cannot "
                                      "be proven started (#570), so that the running image is this file is not proven")
                     res.timings["total_s"] = round(o.clock() - t0, 3)
                     return res
                 res.record = _run_backend(res.backend, host, prep, o)
                 step("load")
-                _verify(res, res.record, uid, prep.family, prep.expect, pre)
+                _verify(res, res.record, uid, prep.family, prep.embedded, pre)
                 step("verify")
         res.ok = res.loaded = True
         res.timings["total_s"] = round(o.clock() - t0, 3)

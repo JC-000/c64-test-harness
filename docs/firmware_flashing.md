@@ -618,8 +618,25 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   images, `.cfw` files and garbage are refused, and so is any file holding
   an updater prompt string or the SILENT marker, whatever its shape. The
   image's family must be the device's.
+- **The image must be the build the caller names.** Both formats carry
+  the application's System Info line, `Git hash:   <hash>`
+  (`system_info.cc`), where the hash is the build's
+  `git rev-parse --short HEAD` (`target/common/rules.mk`), the same macro
+  `/v1/info` reports as `git_commit_hash`. Pre-flight reads it from the
+  file. An image with no such line, or with two different ones, is
+  refused. So is an expected hash that does not begin with every digit
+  the image carries, which includes one with fewer digits than the image
+  has. After the load `/v1/info` must report exactly the image's hash.
+  Read offline from builds on this bench (2026-11-26, no device): three
+  RAM-run `.u64` files and one u64ii `ultimate.app` each carry exactly
+  one such line with a 9-digit hash and none of the updater strings, and
+  pass; an `update.u64`, an `update.ue2`, a raw u64ii `ultimate.bin` and a
+  U64 `ultimate.app` (one record at `0x0`) are refused. The image a U64
+  JTAG reload loads (`jtag_image`) is not read here: that check is its
+  backend's.
 - **Result.** `VolatileResult`: `ok`, `backend`, `family`, `product`,
   `git_hash` (reported by the running firmware), `expect_git_hash`,
+  `image_git_hash` (read from the file),
   `loaded`, `dark_before`, `hash_changed`, `restart_proof`, `timings`
   (seconds per step), `notes`, and the backend's own `record`. A failure
   raises `VolatileLoadError` (a `JtagLoadError`, so it has a `stage`) whose

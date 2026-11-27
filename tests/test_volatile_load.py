@@ -30,6 +30,18 @@ PROMPTS = b"Reformat Flash Disk?\0About to update. Continue?\0Reset Configuratio
 PROMPTS += b"\0" * (-len(PROMPTS) % 4)          # record lengths stay word-aligned, as the loader requires
 
 
+
+
+HASH_A, HASH_B, HASH_BASE = "aaaaaaa11", "bbbbbbb22", "ba5e110e0"
+
+
+def build(fill: bytes, git_hash, n=64) -> bytes:
+    """Application bytes as a firmware build leaves them: code, and the System Info line that carries the build's
+    abbreviated commit hash (system_info.cc: "Git hash:   " APP_VERSION_HASH "\\n"). Word-aligned."""
+    out = fill * n + (b"Git hash:   " + git_hash.encode() + b"\n\0" if git_hash else b"")
+    return out + b"\0" * (-len(out) % 4)
+
+
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -49,7 +61,7 @@ def c64u_app(payload):
     return rec(0x30000, payload, 0x30000)
 
 
-def update_image(payload=b"\x13" * 64 + PROMPTS):
+def update_image(payload=build(b"\x13", HASH_A) + PROMPTS):
     """A plain update image: one record in the updater's load window, started there. "Run Update" on it flashes."""
     return rec(STUB, payload, STUB)
 
@@ -181,7 +193,6 @@ def ticking():
 
 KEYS = {"u64e": "uid-abc123", "c64u": "uid-def456", "both": "uid-0a0b0c", "scanonly": "uid-fed789",
         "nobase": "uid-0d0e0f", "unbound": "uid-123456"}
-HASH_A, HASH_B, HASH_BASE = "aaaaaaa11", "bbbbbbb22", "ba5e110e0"
 
 
 class Bench:
@@ -191,14 +202,15 @@ class Bench:
         self.tmp, self.ev = tmp_path, []
         self.known = {}
         # U64 line: RAM-run images
-        self.u_a = self.u64_image("a.u64", b"\xa5" * 64, HASH_A)
-        self.u_b = self.u64_image("b.u64", b"\x5a" * 64, HASH_B)
-        self.u_base = self.u64_image("base.u64", b"\x11" * 64, HASH_BASE)
+        self.u_a = self.u64_image("a.u64", build(b"\xa5", HASH_A), HASH_A)
+        self.u_b = self.u64_image("b.u64", build(b"\x5a", HASH_B), HASH_B)
+        self.u_base = self.u64_image("base.u64", build(b"\x11", HASH_BASE), HASH_BASE)
         # C64U class: one-record apps plus a bitstream
         self.bit = tmp_path / "x.bit"
         self.bit.write_bytes(b"BIT" * 100)
-        self.c_a = self.c64u_image("a.app", b"\xc1" * 96, HASH_A)
-        self.c_base = self.c64u_image("base.app", b"\xc2" * 96, HASH_BASE)
+        self.c_a_payload = build(b"\xc1", HASH_A, 96)
+        self.c_a = self.c64u_image("a.app", self.c_a_payload, HASH_A)
+        self.c_base = self.c64u_image("base.app", build(b"\xc2", HASH_BASE, 96), HASH_BASE)
         port = tmp_path / "cu.fake"
         port.write_text("")
         self.toml = tmp_path / "bench.toml"
@@ -282,7 +294,7 @@ def test_a_c64u_product_is_a_cold_jtag_load_with_the_same_result_shape(bench):
     assert (r.ok, r.backend, r.family, r.product) == (True, "jtag_cold", "c64u", "C64 Ultimate")
     assert (r.git_hash, r.loaded, r.dark_before, r.restart_proof) == (HASH_A, True, False, "jtag-reconfigured")
     assert set(r.timings) == {"preflight_s", "lock_s", "identify_s", "load_s", "verify_s", "total_s"}
-    assert bench.esp.loaded[3] == b"\xc1" * 96          # the extracted DRAM image, not the .app with its header
+    assert bench.esp.loaded[3] == bench.c_a_payload          # the extracted DRAM image, not the .app with its header
     assert not bench.names("put", "run")
     assert set(vars(r)) == set(vars(vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64))))
 
@@ -324,17 +336,17 @@ def test_an_image_of_the_other_product_is_refused_under_the_lock(bench, dev, ima
 
 BAD_IMAGES = {
     "update-image": update_image(),
-    "update-image-without-prompts": update_image(b"\x13" * 64),
-    "ramrun-around-an-updater": ramrun_image(b"\x13" * 16 + PROMPTS),
-    "c64u-app-that-is-an-updater": c64u_app(b"\x13" * 16 + PROMPTS),
-    "silent-updater": ramrun_image(b"\x13" * 5 + b"bench: forcing module flash"),
-    "cfw": struct.pack("<I", 0x4115ADDE) + b"\x00" * 60,
-    "garbage": bytes(range(256)) * 3,
+    "update-image-without-prompts": update_image(build(b"\x13", HASH_A)),
+    "ramrun-around-an-updater": ramrun_image(build(b"\x13", HASH_A) + PROMPTS),
+    "c64u-app-that-is-an-updater": c64u_app(build(b"\x13", HASH_A) + PROMPTS),
+    "silent-updater": ramrun_image(build(b"\x13", HASH_A) + b"bench: forcing module flash\0"),
+    "cfw": struct.pack("<I", 0x4115ADDE) + build(b"\x00", HASH_A),
+    "garbage": bytes(range(256)) * 3 + build(b"", HASH_A),
     "empty": b"",
     "one-header": struct.pack("<III", 0x30000, 0, 0x30000),
-    "raw-bin": b"\x13\x00\x00\x00" * 64,
-    "c64u-app-at-another-address": rec(0x10000, b"\xc1" * 96, 0x10000),
-    "c64u-app-truncated": c64u_app(b"\xc1" * 96)[:-4],
+    "raw-bin": build(b"\x13\x00\x00\x00", HASH_A),
+    "c64u-app-at-another-address": rec(0x10000, build(b"\xc1", HASH_A, 96), 0x10000),
+    "c64u-app-truncated": c64u_app(build(b"\xc1", HASH_A, 96))[:-4],
 }
 
 
@@ -367,6 +379,54 @@ def test_the_stand_in_would_flash_an_update_image_that_reached_run_update(bench)
     bench.u64.files["/USB1/u.u64"] = update_image()
     bench.u64.run("/USB1/u.u64")
     assert bench.u64.flashed
+
+
+# What the image itself says it is: the build's abbreviated hash, as the firmware prints it in System Info.
+
+def _image(bench, name, data, git_hash=HASH_A, c64u=False):
+    p = bench.tmp / name
+    p.write_bytes(data)
+    extra = dict(bit=bench.bit, bit_sha256=sha(bench.bit.read_bytes())) if c64u else {}
+    return vl.VolatileImage(p, sha(data), git_hash, **extra)
+
+
+@pytest.mark.parametrize("c64u", [False, True], ids=["u64", "c64u"])
+@pytest.mark.parametrize("embedded,named,stage", [
+    (HASH_B, HASH_A, "hash"),                       # the file is another build than the caller names
+    (HASH_A, HASH_A[:7], "hash"),                   # fewer digits than the image carries: not the whole comparison
+    (HASH_A[:8] + "f", HASH_A, "hash"),             # equal in the first eight digits only
+    (None, HASH_A, "image"),                        # no hash in the file: the binding cannot be established
+    ("two", HASH_A, "image"),                       # two different hashes in one file
+], ids=["another-build", "caller-names-fewer-digits", "differs-in-the-last-digit", "no-hash", "two-hashes"])
+def test_an_image_that_is_not_the_build_the_caller_names_is_refused_before_any_lock(bench, c64u, embedded, named,
+                                                                                    stage):
+    app = build(b"\x77", HASH_A) + build(b"\x78", HASH_B) if embedded == "two" else build(b"\x77", embedded)
+    image = _image(bench, "x.img", c64u_app(app) if c64u else ramrun_image(app), named, c64u)
+    dev, host = (bench.c64u, "c64u") if c64u else (bench.u64, "u64e")
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_load(host, image, **bench.opts(dev))
+    assert e.value.stage == stage and bench.ev == []
+
+
+def test_a_longer_hash_from_the_caller_is_compared_over_every_digit_the_image_carries(bench):
+    full = HASH_A + "0123456789abcdef0123456789abcde"          # 40 digits; the image carries the first nine
+    r = vl.volatile_load("u64e", vl.dataclasses.replace(bench.u_a, git_hash=full), **bench.opts(bench.u64))
+    assert (r.ok, r.image_git_hash, r.git_hash) == (True, HASH_A, HASH_A)
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_load("u64e", vl.dataclasses.replace(bench.u_b, git_hash=HASH_B[:8] + "f" + "0" * 31),
+                         **bench.opts(bench.u64))
+    assert e.value.stage == "hash"
+
+
+def test_the_running_hash_must_be_the_images_own_not_a_prefix_of_it(bench):
+    """The firmware reports the very string its image carries, so a report that only shares leading digits with it
+    is another build."""
+    def runner(host, image, **kw):
+        return {"result": "ok", "info": {"unique_id": "ABC123", "product": "Ultimate 64 Elite",
+                                         "git_commit_hash": HASH_A[:8]}}
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64, ram_run=runner))
+    assert e.value.stage == "verify" and e.value.result.image_git_hash == HASH_A
 
 
 def test_a_wrong_sha256_is_refused_before_any_lock(bench):
@@ -428,7 +488,7 @@ def test_a_same_hash_c64u_load_is_proven_by_the_jtag_reload_not_by_the_hash(benc
 
 
 def test_a_c64u_that_reports_another_hash_after_the_load_fails(bench):
-    del bench.known[sha(b"\xc1" * 96)]
+    del bench.known[sha(bench.c_a_payload)]
     with pytest.raises(vl.VolatileLoadError) as e:
         vl.volatile_load("c64u", bench.c_a, **bench.opts(bench.c64u))
     assert e.value.stage == "network" and e.value.result.loaded is False
@@ -522,7 +582,7 @@ def test_a_restore_failure_after_a_clean_body_is_raised(bench):
 
 def test_the_restore_is_attempted_when_the_load_itself_fails(bench):
     bench.c64u.dark = True
-    del bench.known[sha(b"\xc1" * 96)]          # the image comes up reporting another hash
+    del bench.known[sha(bench.c_a_payload)]          # the image comes up reporting another hash
     with pytest.raises(vl.VolatileLoadError) as e:
         with vl.volatile_session("c64u", bench.c_a, **bench.opts(bench.c64u)):
             pytest.fail("the body ran")
