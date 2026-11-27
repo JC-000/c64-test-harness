@@ -11,6 +11,13 @@ before anything else. Next, before any lock, client or upload: the file must be 
 "Run Update" on a plain update.u64 flashes the device; on 2026-11-13 a plain image passed here by mistake flashed a
 U64E.
 
+The DeviceLock may already be held by the caller (#582). A driver that holds it in this process and calls
+``ram_run()`` joins that hold (``allow_nested``) and leaves it held. Under a lock shell (``C64U_LOCK_PID``, an
+ancestor that is the lockfile's holder; docs/device_locking.md, "Lock shells") no lock is taken, and the FTP storage
+helpers and the Remote Menu driver accept the same verified shell. A claim that does not hold (another holder, not an
+ancestor) is refused first, before the identity read and the upload. A shell bound to another device covers nothing
+here: ram_run then takes this device's lock itself.
+
 Steps, all under the device's DeviceLock: identity check (bound unique_id, product "Ultimate 64 Elite"); pinned
 SHA-256 of the image; FTP put to a USB volume through the harness storage helpers (they refuse /Temp); telnet menu
 through the harness's Remote Menu driver (ultimate64_remote_menu.py): browse to the exact path, context menu, "Run
@@ -89,17 +96,6 @@ def check_ramrun_image(data: bytes) -> None:
                                f"{length}, entry {entry:#x}) do not describe the staged record {shape[0]}")
 
 
-def _refuse_lock_shell(host: str) -> None:
-    """ram_run always takes its own DeviceLock: the FTP storage helpers and the Remote Menu driver check that this
-    process holds it (lock_held_for), so a lock shell's hold would let the client through and then stop the run
-    half-way, after the upload. Refused before anything is taken."""
-    pid = os.environ.get("C64U_LOCK_PID")
-    shell_host = os.environ.get("C64U_LOCK_HOST")
-    if pid and (not shell_host or jl.normalize_device_host(shell_host) == jl.normalize_device_host(host)):
-        raise jl.JtagLoadError("lock", f"C64U_LOCK_PID={pid} is set for {host}, but ram_run takes its own DeviceLock "
-                               "(its FTP and telnet steps need it held by this process); run it outside the lock shell")
-
-
 def _menu(host: str):
     from c64_test_harness.backends.ultimate64_remote_menu import Ultimate64RemoteMenu
     return Ultimate64RemoteMenu(host)
@@ -164,8 +160,7 @@ def ram_run(host: str, image, *, sha256: str, expect_git_hash: str, volume: str 
     if dry_run:
         rec["result"] = "dry-run ok"
         return rec
-    _refuse_lock_shell(host)
-    with jl._Locked(host, {}, lock_timeout, lock_factory):
+    with jl._Locked(host, {}, lock_timeout, lock_factory):      # the lock, or a refused lock-shell claim, first
         pre = client_factory(host).get_info()
         jl.check_identity(pre, uid, PRODUCTS)
         rec["pre_info"] = pre
