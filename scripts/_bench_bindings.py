@@ -12,6 +12,15 @@ which adapter or outlet, lives in local configuration:
     jtag_scan_only = true                 # jtag_load.py scan-u64e only: the device is never loaded
     outlet = "http://<plug address>"      # power_outlet.py: the switched outlet ...
     outlet_kind = "shelly-gen2"           # ... and its API ("shelly-gen2" or "tasmota")
+    jtag_blaster_ssh = "<ssh destination>"   # blaster_load_u64.py: where jtagd serves the USB-Blaster ...
+    jtag_blaster_cable = "USB-Blaster"       # ... and text its one cable's name in jtagconfig must contain (both)
+    jtag_blaster_ssh_port = 2200             # optional: the ssh port,
+    jtag_blaster_ssh_identity = "<key file>" # the ssh key,
+    jtag_blaster_env = ". <env script>"      # shell text run before every command there (PATH for the tools),
+    jtag_blaster_jtagd_start = "<command>"   # and the command that starts jtagd there when it is not running
+
+The jtag_blaster_* keys are a separate capability from jtag_adapter_* / jtag_scan_only (the esp-jtag adapter of
+jtag_load.py): neither set of keys enables, or lifts a refusal of, the other script.
 
 It is a separate file from the alias map (devices.toml), which every harness version reads and which refuses any key
 but ``hosts``. Only these scripts read this one. A host is resolved to its unique_id through the alias map, as
@@ -37,6 +46,16 @@ _CHECKS = {
     "jtag_scan_only": (lambda v: isinstance(v, bool), "true or false"),
     "outlet": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
     "outlet_kind": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
+    # An ssh destination is passed to ssh and scp as one argument: no option look-alike, nothing a shell would split.
+    "jtag_blaster_ssh": (lambda v: isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_.@\[\]:-]+", v) is not None
+                         and not v.startswith("-"), "an ssh destination (user@host or a Host alias)"),
+    "jtag_blaster_ssh_port": (lambda v: isinstance(v, int) and not isinstance(v, bool) and 0 < v < 65536,
+                              "a port number"),
+    "jtag_blaster_ssh_identity": (lambda v: isinstance(v, str) and bool(v.strip()) and not v.startswith("-"),
+                                  "a key file path"),
+    "jtag_blaster_cable": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
+    "jtag_blaster_env": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
+    "jtag_blaster_jtagd_start": (lambda v: isinstance(v, str) and bool(v.strip()), "a non-empty string"),
 }
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,15}$")     # as device_aliases._ID_RE
 
