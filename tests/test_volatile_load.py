@@ -76,6 +76,7 @@ class FakeU64:
         self.ev, self.known, self.running, self.uid, self.product = ev, known, running, uid, product
         self.files, self.flashed, self.dark, self.dies_on_run, self.boots_as = {}, False, False, False, None
         self.misses = 0                 # /v1/info reads that go unanswered before it answers again
+        self.drops_file_on_run = False  # the staged file is gone from the volume once the image has started
 
     # REST
     def client(self, host, timeout=5.0):
@@ -133,6 +134,8 @@ class FakeU64:
             self.dark = True
         else:
             self.running = self.boots_as or self.known[digest]
+        if self.drops_file_on_run:
+            del self.files[path]
 
 
 class Storage:
@@ -149,6 +152,8 @@ class Storage:
 
     def storage_delete_file(self, host, path, missing_ok=False):
         self.dev.ev.append(("delete", path))
+        if path not in self.dev.files and not missing_ok:       # as the harness helper
+            raise FileNotFoundError(path)
         self.dev.files.pop(path, None)
 
     def __getattr__(self, name):
@@ -713,6 +718,23 @@ def test_a_dark_u64_without_a_jtag_reload_is_refused_and_nothing_is_staged(bench
         vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64))
     assert e.value.stage == "backend" and e.value.result.dark_before is True
     assert not bench.names("put", "run", "open")
+
+
+def test_dark_is_three_unanswered_reads_with_a_pause_between_them(bench):
+    """A refused connection fails at once, so only the pauses give "dark" a duration: three reads at least 2 s
+    apart, not three refusals inside one blip."""
+    bench.u64.dark = True
+    with pytest.raises(vl.VolatileLoadError):
+        vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64, sleep=lambda s: bench.ev.append(("sleep", s))))
+    assert bench.ev == [("acquire", "device"), ("get_info",), ("sleep", 2.0), ("get_info",), ("sleep", 2.0),
+                        ("get_info",), ("release", "device")]
+
+
+def test_a_staged_file_that_is_already_gone_at_cleanup_is_not_an_error(bench):
+    """ram_run deletes with missing_ok; the storage it is handed must pass that on."""
+    bench.u64.drops_file_on_run = True
+    r = vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64))
+    assert r.ok and "cleanup_error" not in r.record and bench.names("delete") == [("delete", "/USB1/rraaaaaa.u64")]
 
 
 def test_a_dark_u64_goes_through_the_jtag_reload_seam_with_at_least_300_s(bench):
