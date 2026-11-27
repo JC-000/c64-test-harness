@@ -241,8 +241,20 @@ def lock_shell_holds(host: str, *, normalize=None) -> bool:
     storage helpers and the Remote Menu driver also ask: False when ``C64U_LOCK_PID`` is unset or ``C64U_LOCK_HOST``
     names another device; :class:`LockShellClaimError`, never False, when the lockfile's holder is not that PID or
     that PID is not an ancestor of this process. *normalize* compares hosts (default: ``normalize_device_host``).
+
+    Against a harness tree from before #582 (``C64_HARNESS_SRC`` naming an older branch) the check is not there:
+    with ``C64U_LOCK_PID`` unset the answer is still False and the scripts lock as they always did; with it set
+    the claim cannot be verified and is refused (:class:`LockShellClaimError`), never an ImportError.
     """
-    from c64_test_harness.backends.device_lock import lock_shell_holds as _holds
+    if not os.environ.get("C64U_LOCK_PID"):
+        return False                 # no claim to verify: also against a harness tree from before #582
+    try:
+        from c64_test_harness.backends.device_lock import lock_shell_holds as _holds
+    except ImportError:
+        raise LockShellClaimError(
+            f"C64U_LOCK_PID={os.environ['C64U_LOCK_PID']} cannot be verified for {host}: this harness tree "
+            "(C64_HARNESS_SRC?) predates lock_shell_holds in backends/device_lock.py. Run outside the lock "
+            "shell, or against a current tree.") from None
     return _holds(host, normalize=normalize)
 
 

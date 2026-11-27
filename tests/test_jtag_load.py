@@ -924,6 +924,51 @@ def test_the_parent_chain_is_read_from_the_process_table():
     assert not dl._is_ancestor(1)               # init/launchd is everyone's ancestor: never a lock shell
 
 
+def _u64_host_against_an_older_harness(monkeypatch):
+    """scripts/_u64_host.py loaded afresh against a harness tree from before #582 (C64_HARNESS_SRC naming a
+    lane's older branch): its device_lock has neither lock_shell_holds nor LockShellClaimError."""
+    import importlib.util
+    import c64_test_harness.backends.device_lock as dl
+    monkeypatch.delattr(dl, "lock_shell_holds")
+    monkeypatch.delattr(dl, "LockShellClaimError")
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "_u64_host.py")
+    spec = importlib.util.spec_from_file_location("_u64_host_older_harness", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_against_an_older_harness_the_scripts_lock_as_before_without_a_lock_shell(built, tmp_path, monkeypatch):
+    """No C64U_LOCK_PID: nothing needs verifying, so the missing helper must not be reached. The guard passes
+    under this process's own lock and refuses without it, as it did before #582."""
+    old = _u64_host_against_an_older_harness(monkeypatch)
+    assert old.lock_shell_holds(GUARD_HOST) is False
+    with pytest.raises(old.DeviceLockNotHeldError):
+        old.require_device_lock(GUARD_HOST)
+    lock = real_locks(tmp_path)(GUARD_HOST)
+    assert lock.acquire(timeout=5)
+    try:
+        old.require_device_lock(GUARD_HOST)
+    finally:
+        lock.release()
+    monkeypatch.setattr(jl, "lock_shell_holds", old.lock_shell_holds)     # what jtag_load binds from that module
+    with jl._Locked(GUARD_HOST, {}, 5, real_locks(tmp_path)) as held:
+        assert held.dev is not None
+
+
+def test_against_an_older_harness_a_lock_shell_claim_is_refused_not_an_import_error(built, monkeypatch):
+    """C64U_LOCK_PID set, and a tree that cannot verify it: refused closed with the claim error (never False,
+    which would send the tool on to take its own lock behind its own parent)."""
+    old = _u64_host_against_an_older_harness(monkeypatch)
+    monkeypatch.setenv("C64U_LOCK_PID", "4242")
+    monkeypatch.setenv("C64U_LOCK_HOST", GUARD_HOST)
+    with pytest.raises(old.LockShellClaimError, match="cannot be verified"):
+        old.lock_shell_holds(GUARD_HOST)
+    with pytest.raises(old.LockShellClaimError, match="cannot be verified"):
+        old.require_device_lock(GUARD_HOST)
+    assert built == []
+
+
 def test_this_process_own_hold_is_joined_whatever_the_lock_shell_variables_say(built, tmp_path, monkeypatch):
     """A lock shell that calls in-process has exported its own PID (#582): no ancestor, and device_lock_holder
     never names the calling process. Its own hold is what counts: joined, and still held afterwards."""

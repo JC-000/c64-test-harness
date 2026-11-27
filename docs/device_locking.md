@@ -553,6 +553,11 @@ already holds, like `jtag_load.py` and `power_outlet.py`:
 - **A shell bound to another device** covers nothing: the tool takes this
   device's lock itself, and waits or times out as any other process would.
 
+The scripts can run against another harness tree (`C64_HARNESS_SRC`). A
+tree from before #582 has no `lock_shell_holds`: with `C64U_LOCK_PID`
+unset the scripts lock as they always did, and with it set the claim
+cannot be verified and is refused (`LockShellClaimError`).
+
 **The `/Temp` hygiene does not accept a lock shell.** Its ledger, its
 handover sweep and its release drains belong to the process that holds the
 flock, so `Ultimate64Client` and `liveness_probe` still gate on
