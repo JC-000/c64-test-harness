@@ -17,9 +17,10 @@ route is local configuration, in the device's table of bench.toml (_bench_bindin
     jtag_blaster_env = ". <quartus env script>"   # optional: shell text run before every remote command (PATH)
     jtag_blaster_jtagd_start = "<command>"        # optional: starts jtagd when it is not running (see below)
 
-A stopped jtagd is a refusal unless a start command is bound. Lane-reported from one bench VM, not verified here:
-a plain ``jtagconfig`` started jtagd by itself there, so the key is normally left unset and the remedy for the
-refusal is to run ``jtagconfig`` on the far side once.
+A stopped jtagd is a refusal unless a start command is bound. Where jtagd exits when idle, bind
+``jtag_blaster_jtagd_start = "jtagconfig"``: a plain jtagconfig starts jtagd by itself (measured on one bench VM,
+2026-11-27, n=1: refused without the key, started and passed with it). ssh keeps host-key checking on, so the far
+side's key must already be known.
 
 These keys are a capability of their own. ``jtag_scan_only = true`` and the ``jtag_adapter_*`` keys describe the
 esp-jtag adapter that jtag_load.py drives, and are neither read nor changed here: a device may be scan-only for that

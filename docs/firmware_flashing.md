@@ -586,12 +586,18 @@ four are gated by `tests/test_u64_runner_script_gates.py`.
     `jtag_blaster_env` (shell text run before every command there, for
     `PATH`; its own output is discarded) and `jtag_blaster_jtagd_start` (the command that starts `jtagd`
     when it is not running; without it a stopped `jtagd` is a refusal).
-    Lane-reported from this bench's VM and not verified by the harness: a
-    plain `jtagconfig` there started `jtagd` by itself, and the launcher
-    the lane's loader uses does not exist there, so
-    `jtag_blaster_jtagd_start` is normally left unset and the remedy for
-    the refusal is to run `jtagconfig` on the far side once.
-    ssh runs with `BatchMode=yes`, so it never prompts.
+    On a VM where `jtagd` exits when idle, bind
+    `jtag_blaster_jtagd_start = "jtagconfig"`: a plain `jtagconfig` starts
+    `jtagd` by itself. Measured on this bench's VM, 2026-11-27, n=1:
+    without the key the preflight refused (`jtagd is not running`), with
+    it the preflight started `jtagd` and passed. Another lane saw the same
+    auto-start earlier.
+    ssh runs with `BatchMode=yes`, so it never prompts, and host-key
+    checking stays on: the far side's host key must already be in
+    `known_hosts` for the bound destination and port (and the key file
+    usable without a passphrase prompt), or the first step refuses with
+    `[remote] tools: exit 255 ... Host key verification failed` (seen on
+    the first live preflight, 2026-11-27; nothing is touched).
     A harness tree older than this change refuses a device table that
     carries the `jtag_blaster_*` keys (an unknown key fails the whole
     file), so add them only once every tree that reads the file knows
@@ -640,13 +646,20 @@ four are gated by `tests/test_u64_runner_script_gates.py`.
     apart, so that is an outage of roughly 3 to 18 s; a network fault of
     that length looks the same. Without it the load ends `ok-unproven`
     with exit 3: the tool returned 0 and the device answers, as it did
-    before.
+    before. **Measured on a U64E (3.15a), 2026-11-27, n=1:** a same-hash
+    reload of an answering box ended exactly so (`rest_drop_seen` false
+    over the 90 s watch, download exit 0), so on this device a same-image
+    JTAG reload cannot be proven by a REST outage; expect exit 3 for it.
   - `--dry-run` runs the local checks, prints the plan and sends nothing.
     Exit 0 is loaded and proven, 3 loaded but unproven, 2 refused or failed.
-  - **Not run on a device yet.** The command sequence was read from a
-    lane's out-of-tree loader (7 recoveries reported on 2026-11-25) and is
-    exercised here against fakes only. The `jtagconfig -n` layout is the
-    one thing observed: the fakes answer with the recorded listing.
+  - **Run on a device once** (U64E 3.15a, 2026-11-27, n=1 per case):
+    dry run, preflight, a hash-changing load (up after 22.1 s), a load
+    back under a DeviceLock the caller already held (21.5 s), and a
+    same-hash load from a child of a lock shell (unproven, as above). Not
+    run on a device: `--dark` on a box that does not answer, `--srec-sha256`,
+    `--kill-stray-gdb`, a failed download. Those are exercised against
+    fakes only; the lane's out-of-tree loader the sequence was read from
+    reported 7 recoveries of a hung box on 2026-11-25.
 - **`power_outlet.py cycle HOST`** cold-cycles a device through a switched
   outlet (Shelly gen2 or Tasmota), bound in `bench.toml`. Whether it powers
   the device off first is decided under the lock from the `/v1/info`
