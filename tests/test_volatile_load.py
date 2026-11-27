@@ -5,6 +5,7 @@ are one fake (the menu's ENTER starts whatever file was staged, and FLASHES when
 RAM-run image), and a C64 Ultimate whose /v1/info follows what the fake esp-jtag adapter uploaded. Nothing here
 talks to a device or an adapter.
 """
+import functools
 import hashlib
 import inspect
 import json
@@ -21,6 +22,8 @@ import volatile_load as vl  # noqa: E402
 from _u64_host import DeviceLockNotHeldError, require_device_lock  # noqa: E402
 from c64_test_harness.backends.device_lock import DeviceLock  # noqa: E402
 from c64_test_harness.backends.ultimate64_temp_gc import lock_held_for  # noqa: E402
+from lock_shell_fake import FORGED_IDS, FORGED_KW, fake_lock_shell, forge  # noqa: E402
+from test_blaster_load_u64 import Remote as BlasterRemote, elf as nios_elf  # noqa: E402
 from test_jtag_load import FakeEsp  # noqa: E402
 
 APP, STUB, MAGIC = 0x3001000, 0x3000000, 0x524D4152
@@ -262,6 +265,7 @@ class Bench:
         adapter = f'jtag_adapter_location = "{LOCATION}"\njtag_adapter_baud = 460800\n'
         self.toml.write_text(
             "[devices.abc123]\nram_run = true\n" + adapter + "jtag_scan_only = true\n"
+            + 'jtag_blaster_ssh = "blaster-vm"\njtag_blaster_cable = "USB-Blaster"\n'
             + self.baseline(u64_baseline or self.u_base)
             + "[devices.def456]\n" + adapter + self.baseline(c64u_baseline or self.c_base)
             + "[devices.0a0b0c]\nram_run = true\n" + adapter
@@ -747,9 +751,9 @@ def test_a_dark_u64_goes_through_the_jtag_reload_seam_with_at_least_300_s(bench)
     def reload(host, image_path, **kw):
         calls.append((host, image_path, kw))
         bench.u64.dark, bench.u64.running = False, HASH_A
-        return {"result": "ok", "info": bench.u64.get_info()}
+        return {"result": "ok", "restart_proof": "no-answer-before", "info": bench.u64.get_info()}
     r = vl.volatile_load("u64e", image, **bench.opts(bench.u64, u64_jtag_reload=reload))
-    assert (r.ok, r.backend, r.dark_before, r.restart_proof) == (True, "u64_jtag_reload", True, "dark-then-answering")
+    assert (r.ok, r.backend, r.dark_before, r.restart_proof) == (True, "u64_jtag_reload", True, "no-answer-before")
     (host, path, kw), = calls
     assert (host, path, kw["sha256"], kw["expect_git_hash"]) == ("u64e", elf, sha(b"ELF"), HASH_A)
     assert kw["timeout"] >= 300 and not bench.names("put", "run")
@@ -757,6 +761,90 @@ def test_a_dark_u64_goes_through_the_jtag_reload_seam_with_at_least_300_s(bench)
         bench.u64.dark = True
         vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64, u64_jtag_reload=reload))
     assert e.value.stage == "backend" and len(calls) == 1
+
+
+def blaster(bench, dev, comes_up_as=HASH_A):
+    """The merged U64 JTAG reload (blaster_load_u64.blaster_load behind volatile_load's seam) over that script's
+    own stand-in for the far side's tools; the download brings the stand-in U64 up as *comes_up_as*."""
+    remote = BlasterRemote(bench.ev)
+
+    def runner(argv, timeout):
+        reply = remote(argv, timeout)
+        if argv[0] == "ssh" and "nios2-download -g" in argv[-1]:
+            dev.dark, dev.running = False, comes_up_as
+        return reply
+    return remote, functools.partial(vl.blaster_reload, runner=runner, which=lambda tool: "/usr/bin/" + tool,
+                                     drop_window=6)
+
+
+def elf_image(bench, image, git_hash=HASH_A):
+    path = bench.tmp / "app.elf"
+    path.write_bytes(nios_elf(hash_=git_hash))
+    return vl.dataclasses.replace(image, jtag_image=path, jtag_sha256=sha(path.read_bytes()))
+
+
+def test_the_seam_is_wired_to_the_blaster_reload_and_a_dark_u64_comes_back_through_it(bench):
+    assert vl.U64_JTAG_RELOAD is vl.blaster_reload
+    bench.u64.dark = True
+    remote, reload = blaster(bench, bench.u64)
+    r = vl.volatile_load("u64e", elf_image(bench, bench.u_a), **bench.opts(bench.u64, u64_jtag_reload=reload))
+    assert (r.ok, r.loaded, r.backend, r.dark_before) == (True, True, "u64_jtag_reload", True)
+    assert (r.restart_proof, r.git_hash, r.record["dark"]) == ("no-answer-before", HASH_A, True)
+    assert remote.timeouts["download"] == 300 and not bench.names("put", "run")       # the default is the floor
+    remote, reload = blaster(bench, bench.u64)
+    bench.u64.dark, bench.u64.running = True, "f1a54ed00"
+    vl.volatile_load("u64e", elf_image(bench, bench.u_a), **bench.opts(bench.u64, u64_jtag_reload=reload,
+                                                                        jtag_timeout=900))
+    assert remote.timeouts["download"] == 900
+
+
+def test_a_reload_whose_restart_is_not_proven_is_not_reported_ok(bench):
+    """The box misses this wrapper's three reads, then answers the reload's own read with the hash the image has:
+    the download returns 0, REST never drops, and blaster_load says "ok-unproven". That is a failure here, with the
+    stage "unproven" and what was read in the result, not a load with a proof of this wrapper's making."""
+    bench.u64.misses, bench.u64.running = 3, HASH_A
+    remote, reload = blaster(bench, bench.u64)
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_load("u64e", elf_image(bench, bench.u_a), **bench.opts(bench.u64, u64_jtag_reload=reload))
+    r = e.value.result
+    assert e.value.stage == "unproven" and r.record["result"] == "ok-unproven"
+    assert (r.ok, r.loaded, r.restart_proof, r.git_hash, r.dark_before) == (False, False, "none", HASH_A, True)
+
+
+@pytest.mark.parametrize("record", [{}, {"restart_proof": None}, {"restart_proof": "trust-me"},
+                                    {"restart_proof": "hash-change", "result": "ok-unproven"}],
+                         ids=["no-proof", "proof-none", "unknown-proof", "ok-unproven"])
+def test_a_reload_record_without_a_known_proof_is_unproven(bench, record):
+    bench.u64.dark = True
+
+    def reload(host, image_path, **kw):
+        bench.u64.dark, bench.u64.running = False, HASH_A
+        return {"result": "ok", **record, "info": bench.u64.get_info()}
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_load("u64e", elf_image(bench, bench.u_a), **bench.opts(bench.u64, u64_jtag_reload=reload))
+    assert e.value.stage == "unproven" and e.value.result.ok is False
+
+
+def test_the_cli_exits_3_for_an_unproven_restart_and_2_for_any_other_failure(bench, monkeypatch, capsys):
+    def fail(stage):
+        def raiser(host, image, **kw):
+            raise vl.VolatileLoadError(stage, f"[{stage}] x", vl.VolatileResult(ok=False, action="load", host=host))
+        return raiser
+    args = ["load", "u64e", str(bench.u_a.path), "--sha256", bench.u_a.sha256, "--expect-hash", HASH_A]
+    monkeypatch.setattr(vl, "volatile_load", fail("unproven"))
+    assert vl.main(args) == 3
+    monkeypatch.setattr(vl, "volatile_load", fail("verify"))
+    assert vl.main(args) == 2
+    capsys.readouterr()
+
+
+def test_without_a_wired_reload_a_dark_u64_is_refused(bench, monkeypatch):
+    monkeypatch.setattr(vl, "U64_JTAG_RELOAD", None)
+    bench.u64.dark = True
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_load("u64e", elf_image(bench, bench.u_a), **bench.opts(bench.u64))
+    assert e.value.stage == "backend" and "power cycle" in str(e.value)
+    assert bench.names("acquire", "release", "get_info") == bench.ev
 
 
 def test_a_dark_u64_that_the_reload_brings_back_as_another_device_fails(bench):
@@ -808,17 +896,70 @@ def test_one_lock_acquire_brackets_everything(bench):
     assert at_body == 1 and at_loads == [3, 3]          # session + volatile_load + jtag_load, for load and restore
 
 
-def test_under_a_lock_shell_the_session_takes_no_device_lock_and_a_ram_run_is_refused_unstaged(bench, monkeypatch):
-    """A verified lock shell's hold is the hold for the JTAG path. ram_run needs the lock in this process and
-    refuses before anything is staged (the seam to #582)."""
-    monkeypatch.setenv("C64U_LOCK_PID", "4242")
-    monkeypatch.setattr(jl, "lock_shell_holds", lambda host, normalize=None: True)
-    with vl.volatile_session("c64u", bench.c_a, **bench.opts(bench.c64u)) as s:
-        assert s.lock_in_process is False and s.load.ok
-    assert s.restore.ok and ("acquire", "device") not in bench.ev and ("acquire", "adapter") in bench.ev
+@pytest.mark.parametrize("host", ["u64e", "c64u"])
+def test_under_a_verified_lock_shell_the_session_takes_no_device_lock_and_both_backends_load(bench, monkeypatch,
+                                                                                            host):
+    """The shell's hold is the hold (#582): nothing is acquired for the device, and the RAM-run goes through as
+    the JTAG load does."""
+    fake_lock_shell(monkeypatch, host)
+    dev, image = (bench.u64, bench.u_a) if host == "u64e" else (bench.c64u, bench.c_a)
+    with vl.volatile_session(host, image, **bench.opts(dev)) as s:
+        assert s.lock_in_process is False and s.load.ok and s.load.git_hash == HASH_A
+    assert s.restore.ok and s.restore.git_hash == HASH_BASE and ("acquire", "device") not in bench.ev
+
+
+@pytest.mark.parametrize("kw", FORGED_KW, ids=FORGED_IDS)
+@pytest.mark.parametrize("host", ["u64e", "c64u"])
+def test_a_lock_shell_claim_that_does_not_hold_is_refused_before_any_traffic(bench, monkeypatch, host, kw):
+    forge(monkeypatch, host, kw)
+    dev, image = (bench.u64, bench.u_a) if host == "u64e" else (bench.c64u, bench.c_a)
     with pytest.raises(vl.VolatileLoadError) as e:
-        vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64))
-    assert e.value.stage == "lock" and not bench.names("put", "run")
+        vl.volatile_load(host, image, **bench.opts(dev))
+    assert e.value.stage == "lock" and bench.ev == []
+    with pytest.raises(jl.JtagLoadError) as e:
+        with vl.volatile_session(host, image, **bench.opts(dev)):
+            pytest.fail("the body ran")
+    assert e.value.stage == "lock" and bench.ev == []
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_restore(host, **bench.opts(dev))
+    assert e.value.stage == "lock" and bench.ev == []
+
+
+def test_a_lock_shell_for_another_device_covers_nothing_here(bench, monkeypatch):
+    fake_lock_shell(monkeypatch, "c64u")
+    assert vl.volatile_load("u64e", bench.u_a, **bench.opts(bench.u64)).ok
+    assert bench.ev[0] == ("acquire", "device") and bench.ev[-1] == ("release", "device")
+
+
+def test_a_hold_this_process_already_has_is_joined_even_with_its_own_pid_exported(bench, monkeypatch, tmp_path):
+    """A driver that holds the lock and is a lock shell for its children (its own PID in C64U_LOCK_PID): the same
+    claim is refused when the process does not hold the lock (the forged case "names itself")."""
+    def real(name, allow_nested=False):
+        return DeviceLock(name, lock_dir=tmp_path / "locks", heartbeat_interval=None, allow_nested=allow_nested)
+    outer = real("u64e", allow_nested=True)
+    assert outer.acquire(timeout=5)
+    try:
+        monkeypatch.setenv("C64U_LOCK_PID", str(os.getpid()))
+        monkeypatch.setenv("C64U_LOCK_HOST", "u64e")
+        with vl.volatile_session("u64e", bench.u_a, **bench.opts(bench.u64, lock_factory=real)) as s:
+            assert s.lock_in_process and s.load.ok
+        assert lock_held_for("u64e")                # the caller's hold is still the caller's
+    finally:
+        outer.release()
+    assert not lock_held_for("u64e")
+
+
+def test_the_bindings_are_read_from_the_file_the_environment_names(bench, monkeypatch, tmp_path):
+    """A live run points C64_BENCH_BINDINGS_FILE at a private file; the default bench.toml is not consulted."""
+    shared = tmp_path / "xdg" / "c64-test-harness"
+    shared.mkdir(parents=True)
+    (shared / "bench.toml").write_text("[devices.abc123]\nram_run = true\n")       # no baseline there
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert vl.volatile_restore("u64e", dry_run=True, **bench.opts(bench.u64))["expect_git_hash"] == HASH_BASE
+    monkeypatch.delenv("C64_BENCH_BINDINGS_FILE")
+    with pytest.raises(vl.VolatileLoadError) as e:
+        vl.volatile_restore("u64e", dry_run=True, **bench.opts(bench.u64))
+    assert e.value.stage == "baseline"
 
 
 # ---- 7. adapter safety; the storage-staged path writes one file and removes it ------------------------------------

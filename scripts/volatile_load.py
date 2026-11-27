@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""One volatile (no-flash) firmware load for both Ultimate products, above ram_run_u64.py and jtag_load.py (#585).
+"""One volatile (no-flash) firmware load for both Ultimate products, above ram_run_u64.py, jtag_load.py and
+blaster_load_u64.py (#585).
 
     volatile_load(host, image)        load a volatile image; the backend follows the device's product
     volatile_restore(host)            back to the baseline image configured in the local bench.toml
@@ -12,9 +13,10 @@ Backends (this file adds no device I/O of its own beyond a bodyless /v1/info rea
   * "jtag_cold" "C64 Ultimate" / "Ultimate 64-II": jtag_load.jtag_load, always cold (the CPU is held in reset
                 from the FPGA load until the upload is complete). This API has no warm variant and passes
                 cold=True whatever JTAG_LOAD_WARM says. Works on a box that does not answer on the network.
-  * "u64_jtag_reload"  a U64-line box that does not answer: a JTAG reload through a second adapter. It is an
-                injected callable (see U64_JTAG_RELOAD below); while none is wired this is a refusal, and the
-                way back is a power cycle.
+  * "u64_jtag_reload"  a U64-line box that does not answer: blaster_load_u64.blaster_load (the application ELF
+                over JTAG through a USB-Blaster route, with that script's own binding and gates), called with
+                dark=True. The image must name the ELF (jtag_image, jtag_sha256). The callable is replaceable
+                (U64_JTAG_RELOAD below).
 The backend is chosen under the lock from the /v1/info product. A box that does not answer (three polls) is "dark":
 the backend then follows the image's product family, which the device's bench.toml table must enable, and the
 device's identity (unique_id, product) is confirmed on /v1/info after the load.
@@ -48,14 +50,25 @@ of the same family, else the call fails. What the result claims about a restart 
   * "hash-change"        the reported hash before the load differed from the expected one and now equals it;
   * "jtag-reconfigured"  the FPGA was reloaded cold over JTAG and the user ID read back (jtag_cold). This holds
                          for a same-hash load as well;
-  * "dark-then-answering" the box did not answer before and answers now with the expected hash;
+  * "no-answer-before", "rest-drop"  (u64_jtag_reload) blaster_load's own proofs, carried through as it reports
+                         them, as is its "hash-change": the box did not answer before the load and answers now;
+                         or REST went away after the download although the hash was the same;
   * "none"               nothing was loaded (see "loaded"), or the backend gave no evidence.
+A reload that blaster_load ends as "ok-unproven" (the device reported the image's hash before the load as well, and
+REST never dropped; measured once on an Ultimate 64 Elite, 2026-11-27: a same-hash reload showed no REST outage)
+is NOT ok here: the call fails with the stage "unproven" (CLI exit 3), the result keeps what was read, and no proof
+is made up for it. The same goes for a reload record with no proof, or one this file does not know.
 A same-hash RAM-run cannot be proven started (#570), so ram_run refuses it; volatile_restore on a U64-line device
 that already reports the baseline hash therefore loads nothing and says so (loaded False, restart_proof "none"):
 that the running image IS the baseline file is then not proven, only that the hashes agree.
 
-``jtag_timeout`` below MIN_JTAG_TIMEOUT_S is refused. It is the budget handed to the U64 JTAG reload and applies
-to nothing else: it does not reach jtag_load.py. This file puts no deadline around the cold esp-jtag load, but
+``jtag_timeout`` below MIN_JTAG_TIMEOUT_S is refused. It is the budget handed to the U64 JTAG reload (blaster_load's
+download_timeout, the deadline around its one nios2-download) and applies to nothing else: it does not reach
+jtag_load.py. The floor stays at 300 s and is also the default. One measured hash-changing reload came up in about
+22 s (n=1), so 300 s is more than ten times what a good download took; the floor is not there to fit the usual case
+but to keep a caller from cutting a download that is slow for a reason nobody has seen yet, since a cut download
+leaves the Nios paused and the box dark until a power cycle, while a hung one only costs the wait. One run does not
+justify a lower floor, and blaster_load's own default is the same 300 s. This file puts no deadline around the cold esp-jtag load, but
 jtag_load.py runs it with the kit's link timeout of 10 s per adapter transaction, and after a link error once the
 FPGA is programmed it retries the whole load once and then leaves the box dark. So "no timeout under 300 s around a
 JTAG operation" holds for the deadlines this file sets, not for that per-transaction one.
@@ -73,7 +86,7 @@ Baseline, in the device's table of the local bench.toml (never in a tracked file
     volatile_baseline_jtag_image = "<path>"     # U64 line, optional: what the U64 JTAG reload loads into a dark box
     volatile_baseline_jtag_sha256 = "<64 hex>"
 
-CLI (a failure exits 2; --dry-run prints the plan and takes no lock, opens no client, storage, menu or adapter):
+CLI (a failure exits 2, a reload whose restart is not proven exits 3; --dry-run prints the plan and takes no lock, opens no client, storage, menu or adapter):
 
     volatile_load.py load    HOST IMAGE --sha256 H --expect-hash G [--bit F --bit-sha256 H]
                              [--jtag-image F --jtag-sha256 H] [--baseline-first] [--dry-run] [--record F]
@@ -109,13 +122,30 @@ PRODUCT_FAMILY = {**{p: FAMILY_U64 for p in rr.PRODUCTS}, **{p: FAMILY_C64U for 
 
 BACKEND_RAM_RUN, BACKEND_JTAG_COLD, BACKEND_U64_JTAG = "ram_run", "jtag_cold", "u64_jtag_reload"
 
-#: The seam to the U64-line JTAG reload (#583). None = not wired: a dark U64-line box is refused. A callable
+#: Restart proofs a U64 JTAG reload record may carry; anything else, or result "ok-unproven", is unproven here.
+RELOAD_PROOFS = ("hash-change", "no-answer-before", "rest-drop")
+
+
+def blaster_reload(host: str, image_path, *, sha256, expect_git_hash, timeout, lock_timeout, lock_factory,
+                   client_factory, dry_run, sleep, clock, log, **blaster_options) -> dict:
+    """The U64-line JTAG reload: blaster_load_u64.blaster_load on a box that need not answer before the load
+    (dark=True; if it does answer, blaster_load still checks its identity). *timeout* becomes its download_timeout.
+    *blaster_options* go to blaster_load unchanged (its runner, for tests)."""
+    import blaster_load_u64 as bl
+    return bl.blaster_load(host, image_path, sha256=sha256, expect_git_hash=expect_git_hash, dark=True,
+                           dry_run=dry_run, lock_timeout=lock_timeout, download_timeout=timeout,
+                           lock_factory=lock_factory, client_factory=client_factory, sleep=sleep, clock=clock,
+                           log=log, **blaster_options)
+
+
+#: The U64-line JTAG reload used for a dark box. Any callable
 #:     reload(host, image_path, *, sha256, expect_git_hash, timeout, lock_timeout, lock_factory, client_factory,
 #:            dry_run, sleep, clock, log) -> dict
 #: that enforces its own adapter binding, loads *image_path* without writing flash into a box that may not answer
-#: before the load, and returns a record whose "info" is the /v1/info read afterwards. *timeout* is the budget of
-#: its JTAG operation and is never below MIN_JTAG_TIMEOUT_S.
-U64_JTAG_RELOAD = None
+#: before the load, and returns a record with "info" (the /v1/info read afterwards), "result" and "restart_proof"
+#: (one of RELOAD_PROOFS). *timeout* is the budget of its JTAG operation, never below MIN_JTAG_TIMEOUT_S. None: a
+#: dark U64-line box is refused.
+U64_JTAG_RELOAD = blaster_reload
 
 DARK_POLLS = 3
 
@@ -330,7 +360,7 @@ def _check_device(info: dict, uid: str, family: str, when: str) -> None:
 class _Opts:
     lock_timeout: float = 600
     net_timeout: float = 180
-    jtag_timeout: float = 600
+    jtag_timeout: float = MIN_JTAG_TIMEOUT_S
     volume: str = "USB1"
     lock_factory: object = jl.DeviceLock
     client_factory: object = jl._client
@@ -365,8 +395,8 @@ def _backend_for(family: str, dark: bool, prep: _Prepared, o: _Opts) -> str:
         return BACKEND_RAM_RUN
     if o.u64_jtag_reload is None:
         raise jl.JtagLoadError("backend", "the device does not answer on the network, a RAM-run needs it, and no "
-                               "U64 JTAG reload is wired into this build; power cycle it to return to the flashed "
-                               "image")
+                               "U64 JTAG reload is set (U64_JTAG_RELOAD is None); power cycle it to return to the "
+                               "flashed image")
     if prep.image.jtag_image is None or not prep.image.jtag_sha256:
         raise jl.JtagLoadError("backend", "the device does not answer on the network and the image names no "
                                "jtag_image / jtag_sha256 for the U64 JTAG reload")
@@ -451,14 +481,21 @@ def _verify(res: VolatileResult, rec: dict, uid: str, family: str, expect: str, 
             raise jl.JtagLoadError("verify", f"the JTAG load does not record a cold load with the user ID read back "
                                    f"(cold {rec.get('cold')!r}, user_id {rec.get('user_id')!r})")
         res.restart_proof = "jtag-reconfigured"
+    elif res.backend == BACKEND_U64_JTAG:
+        # The reload saw the box itself, later than this file's own reads: its proof is carried through, and its
+        # "ok-unproven" stays unproven. Nothing is derived here from "it was dark when I looked".
+        proof = rec.get("restart_proof")
+        if rec.get("result") != "ok" or proof not in RELOAD_PROOFS:
+            raise jl.JtagLoadError("unproven", f"the JTAG reload came back as {rec.get('result')!r} with restart "
+                                   f"proof {proof!r}: the device answers with {expect}, but that it restarted is "
+                                   f"not proven ({rec.get('unproven') or 'no proof in the record'}; #570)")
+        res.restart_proof = proof
     elif res.hash_changed:
         res.restart_proof = "hash-change"
-    elif pre is None:
-        res.restart_proof = "dark-then-answering"
     else:
         raise jl.JtagLoadError("verify", f"the device did not report another hash than {expect} before the load "
-                               f"(it reported {pre.get('git_commit_hash')!r}), and this backend gives no other "
-                               "evidence of a restart (#570)")
+                               f"(it reported {(pre or {}).get('git_commit_hash')!r}), and this backend gives no "
+                               "other evidence of a restart (#570)")
 
 
 def _load(host: str, image: VolatileImage, action: str, o: _Opts, *, skip_if_running: bool = False,
@@ -553,8 +590,9 @@ def volatile_restore(host: str, *, force: bool = False, dry_run: bool = False, *
 class VolatileSession:
     """What volatile_session yields. ``load``: the result of the image's load. ``baseline_first`` / ``restore``:
     those results, when they ran. ``restore_error``: why the restore failed. ``restore_skipped``: why none was
-    started (an interrupt). ``lock_in_process``: False when a
-    lock shell holds the DeviceLock, in which case harness helpers that check for an in-process hold refuse."""
+    started (an interrupt). ``lock_in_process``: False when a verified lock shell holds the DeviceLock. The storage
+    helpers, the Remote Menu driver and the bench scripts accept that hold (#582); Ultimate64Client's /Temp hygiene on
+    a leak-prone device, flash_firmware and save_config_item_to_flash still need the lock held by this process."""
 
     def __init__(self, host: str, options: dict):
         self.host, self._options = host, options
@@ -648,7 +686,7 @@ def main(argv=None) -> int:
         p.add_argument("--volume", default="USB1")
         p.add_argument("--lock-timeout", type=float, default=600)
         p.add_argument("--net-timeout", type=float, default=180)
-        p.add_argument("--jtag-timeout", type=float, default=600,
+        p.add_argument("--jtag-timeout", type=float, default=MIN_JTAG_TIMEOUT_S,
                        help=f"budget of the U64 JTAG reload only (a C64 Ultimate load takes none); under "
                             f"{MIN_JTAG_TIMEOUT_S:.0f} s is refused")
         p.add_argument("--dry-run", action="store_true", help="print the plan; nothing is locked or touched")
@@ -673,7 +711,7 @@ def main(argv=None) -> int:
         print(f"FAIL {type(e).__name__}: {e}", file=sys.stderr)
         outs.append(_as_json(getattr(e, "result", None)) or {"action": a.cmd, "host": a.host, "ok": False,
                                                               "error": f"{type(e).__name__}: {e}"})
-        rc = 2
+        rc = 3 if getattr(e, "stage", None) == "unproven" else 2
     else:
         rc = 0
     outs = [_as_json(x) for x in outs]

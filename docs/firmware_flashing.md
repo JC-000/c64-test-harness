@@ -680,8 +680,8 @@ four are gated by `tests/test_u64_runner_script_gates.py`.
 
 ### One volatile load for both products: `volatile_load.py` (#585)
 
-`scripts/volatile_load.py` sits above `ram_run_u64.py` and `jtag_load.py`
-and gives both products one call, one result shape and one way back. It
+`scripts/volatile_load.py` sits above `ram_run_u64.py`, `jtag_load.py` and
+`blaster_load_u64.py` and gives both products one call, one result shape and one way back. It
 adds no device I/O of its own beyond a bodyless `/v1/info` read; each
 backend keeps its gates.
 
@@ -701,10 +701,12 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   that does not answer three polls is dark: the backend then follows the
   image's family, which the device's `bench.toml` table must enable, and
   the identity is checked on `/v1/info` after the load. A dark U64-line
-  box needs a JTAG reload through a second adapter (#583). That backend is
-  an injected callable (`u64_jtag_reload`, default
-  `volatile_load.U64_JTAG_RELOAD`); while none is wired it is a refusal,
-  and the way back is a power cycle.
+  box goes to `blaster_load_u64.blaster_load` with `dark=True` (the
+  `u64_jtag_reload` backend; the callable is
+  `volatile_load.U64_JTAG_RELOAD`, replaceable per call). That script
+  keeps its own binding (`jtag_blaster_*`) and gates, and the image must
+  name the application ELF it loads (`jtag_image`, `jtag_sha256`); without
+  one a dark U64-line box is refused and the way back is a power cycle.
 - **Images.** Checked before any lock, upload or JTAG pin. Exactly two
   shapes pass: a RAM-run file (`check_ramrun_image`) for the U64 line, and
   a one-record `ultimate.app` at `0x30000` plus the FPGA `.bit` for the
@@ -744,7 +746,13 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   hash. `restart_proof` then says why the load is believed to have
   started: `hash-change`; `jtag-reconfigured` (the FPGA was reloaded cold
   and the user ID read back, which also covers a same-hash load);
-  `dark-then-answering`; or `none`. A same-hash RAM-run cannot be proven
+  the reload's own `no-answer-before` or `rest-drop` (and its
+  `hash-change`), carried through as `blaster_load` reports them; or
+  `none`. A reload that `blaster_load` ends as `ok-unproven` is not ok
+  here: the call fails with the stage `unproven` (CLI exit 3) and the
+  result keeps what was read. Measured once (Ultimate 64 Elite,
+  2026-11-27, n=1): a same-hash JTAG reload showed no REST outage, so that
+  case is real. A same-hash RAM-run cannot be proven
   (#570) and `ram_run` refuses it. A U64-line device that reports no hash
   before the load (no `git_commit_hash`, or one that is not 7 or more hex
   digits) is refused the same way, before anything is staged: a change
@@ -761,7 +769,14 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   class also `volatile_baseline_bit` and `volatile_baseline_bit_sha256`;
   optionally, for the U64 line, `volatile_baseline_jtag_image` and
   `volatile_baseline_jtag_sha256` (what a JTAG reload loads into a dark
-  box). The session restores on the way out, also when the load or the
+  box). **Upgrade hazard, as for the `jtag_blaster_*` keys:** a harness
+  tree older than this change refuses a device table that carries the
+  `volatile_baseline_*` keys (an unknown key fails the whole file), so
+  every bench script run from such a tree stops until the keys are
+  removed or that tree is pointed at another file with
+  `C64_BENCH_BINDINGS_FILE`. Every path here reads the file that variable
+  names, so a run can keep its baseline in a private bindings file and
+  leave the shared one unchanged. The session restores on the way out, also when the load or the
   body raised. The body's exception propagates; a restore failure is then
   kept in `session.restore_error` and logged, and is raised only after a
   clean body. A `KeyboardInterrupt` or `SystemExit` starts no restore
@@ -771,10 +786,18 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   cuts a JTAG load half-way.
 - **Lock.** The session takes the `DeviceLock` in this process
   (`allow_nested`), so the backends and the harness helpers called in the
-  body join it. Under a verified lock shell it takes none
-  (`session.lock_in_process` is False): the C64U path works, the RAM-run
-  path is refused by `ram_run_u64.py`, and helpers that check for an
-  in-process hold refuse (#582).
+  body join it; a hold this process already has is joined as well, even
+  when it has exported its own PID as a lock shell for its children.
+  Under a verified ancestor lock shell it takes none
+  (`session.lock_in_process` is False) and both backends, the storage
+  helpers and the Remote Menu driver accept the shell's hold (#582). A
+  claim that does not hold (another holder, nobody, not an ancestor,
+  unreadable parents) is refused with the stage `lock` before any
+  `/v1/info` read; a shell bound to another device covers nothing and the
+  lock is taken normally. `Ultimate64Client`'s `/Temp` hygiene on a
+  leak-prone device, `flash_firmware` and `save_config_item_to_flash`
+  still need the lock held by this process, so a body that uses those runs
+  with an in-process hold, not under a shell.
 - **Adapter.** Only the adapter bound to the device in `bench.toml` is
   used. A `jtag_scan_only` device and a missing binding are refused before
   the lock, and so is a `JTAG_USB_LOCATION` that names another location
@@ -782,9 +805,14 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   `jtag_load.py`'s live IDCODE gate still runs before the FPGA is touched.
 - **Cold only.** The C64 Ultimate load is always cold. There is no option
   for a warm load, and `JTAG_LOAD_WARM` is not honoured here.
-- **JTAG timeout.** `jtag_timeout` under 300 s is refused (300 passes).
-  It is the budget handed to the U64 JTAG reload and applies to nothing
-  else: it does not reach `jtag_load.py`, so it changes nothing for a C64
+- **JTAG timeout.** `jtag_timeout` under 300 s is refused (300 passes,
+  and is the default). It is the budget handed to the U64 JTAG reload
+  (`blaster_load`'s `download_timeout`, around its one `nios2-download`).
+  One measured hash-changing reload came up in about 22 s (n=1), so 300 s
+  is over ten times a good download. The floor is kept anyway: a cut
+  download leaves the Nios paused and the box dark until a power cycle,
+  a hung one only costs the wait, and one run does not justify less. It
+  applies to nothing else: it does not reach `jtag_load.py`, so it changes nothing for a C64
   Ultimate. `volatile_load.py` puts no deadline around the cold esp-jtag
   load, but `jtag_load.py` runs it with the kit's link timeout of 10 s per
   adapter transaction, and after a link error once the FPGA is programmed
